@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* Optional: you can add your global styles here */
+body {
+  font-family: 'Raleway', sans-serif;
+}
+
+/* Remove default react-calendar blue background */
+.react-calendar__tile--active {
+  background: transparent !important;
+  color: inherit !important;
+}
+
+/* Optional: also remove hover/active default */
+.react-calendar__tile:enabled:hover,
+.react-calendar__tile:enabled:focus {
+  background: transparent !important;
+}
