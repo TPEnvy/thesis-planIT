@@ -10,27 +10,47 @@ dayjs.extend(timezone);
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000";
 const TZ = "Asia/Manila";
 
-// Strip "virt_" and optional trailing "-YYYY" (keep real UUID/ObjectId intact)
+// helpers: strip virt_ prefix and trailing -YYYY if present
 const baseId = (v = "") => {
   const s = String(v || "");
   const noVirt = s.startsWith("virt_") ? s.slice(5) : s;
   return noVirt.replace(/-\d{4}$/, "");
 };
-
 const toTz = (d) => dayjs(d).tz(TZ);
 
+// Difficulty chunk percentages (P)
+const DIFF_P = {
+  easy: 0.6,
+  medium: 0.75,
+  hard: 0.85,
+};
+
+// Urgency "weight" for determining segment count (Uweight)
+const URG_WEIGHT = {
+  low: 0.5,
+  high: 1.0,
+};
+
+// Urgency reduces break fraction slightly (higher urgency -> smaller break fraction)
+const URG_BREAK_REDUCER = {
+  low: 0.05,
+  high: 0.1,
+};
+
 export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess }) {
-  const [mode, setMode] = useState("byCount"); // "byCount" | "byDuration"
-  const [count, setCount] = useState(2);
-  const [segmentMinutes, setSegmentMinutes] = useState(30);
-  const [breakMinutes, setBreakMinutes] = useState(0);
+  // Inputs & UI state
   const [titlePrefix, setTitlePrefix] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState("");
+  const [segmentNames, setSegmentNames] = useState([]);
 
   const dialogRef = useRef(null);
 
-  // Scroll lock + ESC close + focus trap (hooks always run; logic gated inside)
+  // Auto parameters
+  const baseBreakFrac = 0.2; // default base break fraction (20%)
+  const minSegMin = 30; // minimum segment length in minutes (safeguard)
+
+  // Modal lifecycle hooks (scroll lock / focus trap / ESC)
   useEffect(() => {
     if (!isOpen) return;
     const prev = document.body.style.overflow;
@@ -42,9 +62,7 @@ export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess })
     const selector =
       'a[href], button, textarea, input, select, [tabindex]:not([tabindex="-1"])';
     const focusables = () =>
-      Array.from(root?.querySelectorAll(selector) || []).filter(
-        (n) => !n.hasAttribute("disabled")
-      );
+      Array.from(root?.querySelectorAll(selector) || []).filter((n) => !n.hasAttribute("disabled"));
     const onKeydown = (e) => {
       if (e.key !== "Tab") return;
       const nodes = focusables();
@@ -71,80 +89,128 @@ export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess })
   // Reset state when opening
   useEffect(() => {
     if (!isOpen) return;
-    setMode("byCount");
-    setCount(2);
-    setSegmentMinutes(30);
-    setBreakMinutes(0);
     setTitlePrefix("");
     setSubmitting(false);
     setErr("");
+    setSegmentNames([]);
   }, [isOpen]);
 
-  // Compute total minutes safely even when event is undefined (hook must run every render)
+  // compute total minutes safely
   const totalMin = useMemo(() => {
     if (!event) return 0;
-    const start = toTz(event.start);
-    const end = toTz(event.end);
-    if (!start.isValid() || !end.isValid()) return 0;
-    return Math.max(0, end.diff(start, "minute"));
+    const s = toTz(event.start);
+    const e = toTz(event.end);
+    if (!s.isValid() || !e.isValid() || !e.isAfter(s)) return 0;
+    return Math.max(0, e.diff(s, "minute"));
   }, [event]);
 
-  // Derived preview + validation (hook runs every render; uses safe totalMin)
-  const { valid, preview, computedCount } = useMemo(() => {
-    let ok = true;
-    let previewText = "";
-    let cCount = 0;
-
-    const nBreak = Math.max(0, Number(breakMinutes) || 0);
-    const breaksTotalFor = (n) => Math.max(0, n - 1) * nBreak;
-
-    if (totalMin <= 0) {
-      return { valid: false, preview: "This event has zero/invalid duration.", computedCount: 0 };
+  // Auto segmentation algorithm
+  const autoResult = useMemo(() => {
+    if (!event || totalMin <= 0) {
+      return {
+        valid: false,
+        reason: "Invalid event duration",
+        segments: [],
+        count: 0,
+        perBreakMin: 0,
+        segmentMinutes: 0,
+      };
     }
 
-    if (mode === "byCount") {
-      const n = Math.max(1, Number(count) || 0);
-      const usable = totalMin - breaksTotalFor(n);
-      if (usable <= 0) {
-        ok = false;
-        previewText = `Not enough time for ${n} segments with ${nBreak}m breaks.`;
-      } else {
-        const per = Math.floor(usable / n);
-        if (per <= 0) {
-          ok = false;
-          previewText = `Not enough time for ${n} segments with ${nBreak}m breaks.`;
-        } else {
-          cCount = n;
-          previewText = `Will create ${n} segment${n > 1 ? "s" : ""} of ~${per} min each`;
-        }
-      }
-    } else {
-      const perSeg = Math.max(1, Number(segmentMinutes) || 0);
-      const denom = perSeg + nBreak;
-      const n = Math.floor((totalMin + nBreak) / Math.max(1, denom));
-      if (n <= 0) {
-        ok = false;
-        previewText = `Not enough time for ${perSeg}m segments with ${nBreak}m breaks.`;
-      } else {
-        cCount = n;
-        previewText = `Will create ${n} segment${n > 1 ? "s" : ""} of ${perSeg} min each`;
-      }
+    // Duration in hours
+    const D = totalMin / 60;
+    const diffKey = (event.difficulty || "medium").toLowerCase();
+    const urgencyKey = (event.urgency || "low").toLowerCase();
+
+    const P = DIFF_P[diffKey] ?? DIFF_P.medium;
+    const Uweight = URG_WEIGHT[urgencyKey] ?? URG_WEIGHT.low;
+    const urgencyReducer = URG_BREAK_REDUCER[urgencyKey] ?? URG_BREAK_REDUCER.low;
+
+    // raw segment count
+    let S_raw = Math.max(1, D * P * Uweight);
+    let S = Math.max(1, Math.ceil(S_raw));
+    const maxS = Math.max(1, Math.floor(totalMin / Math.max(1, minSegMin)));
+    if (S > maxS) S = maxS;
+
+    // break fraction adjusted by urgency
+    const bf = Math.max(0, baseBreakFrac - urgencyReducer);
+
+    // initial raw per-segment minutes
+    let rawSegMin = Math.floor(totalMin / S);
+    let perBreakMin = Math.floor(rawSegMin * bf);
+    let segMin = Math.floor((totalMin - perBreakMin * (S - 1)) / S);
+
+    // ensure every segment meets minSegMin by decreasing S until it does
+    while (S > 1 && segMin < minSegMin) {
+      S = S - 1;
+      rawSegMin = Math.floor(totalMin / S);
+      perBreakMin = Math.floor(rawSegMin * bf);
+      segMin = Math.floor((totalMin - perBreakMin * (S - 1)) / S);
     }
 
-    return { valid: ok, preview: previewText, computedCount: cCount };
-  }, [mode, count, segmentMinutes, breakMinutes, totalMin]);
+    // build plan
+    const plan = [];
+    let cursor = toTz(event.start).valueOf();
+    for (let i = 0; i < S; i++) {
+      const startMs = cursor;
+      const thisEnd = startMs + segMin * 60 * 1000;
+      const endMs = i === S - 1 ? toTz(event.end).valueOf() : Math.min(thisEnd, toTz(event.end).valueOf());
+      plan.push({ startMs, endMs });
+      cursor = endMs + perBreakMin * 60 * 1000;
+    }
 
-  // ✅ Hooks are all above; safe to early-return now
-  if (!isOpen || !event) return null;
+    const segments = plan.map((p, i) => ({
+      index: i,
+      start: new Date(p.startMs),
+      end: new Date(p.endMs),
+      minutes: Math.round((p.endMs - p.startMs) / 60000),
+      title: `${titlePrefix || event.title} — Segment ${i + 1}`,
+    }));
+
+    return {
+      valid: S >= 1 && segments.length > 0,
+      reason: S >= 1 ? "" : "Not enough time",
+      segments,
+      count: S,
+      perBreakMin,
+      segmentMinutes: segMin,
+      baseBreakFrac,
+      bf,
+      P,
+      Uweight,
+      S_raw,
+    };
+  }, [event, totalMin, titlePrefix]);
+
+  // Prepare editable names when autoResult changes
+  useEffect(() => {
+    if (!isOpen) return;
+    const names = autoResult.segments.map((s) => s.title);
+    setSegmentNames(names);
+  }, [isOpen, autoResult]);
+
+  const canSplit = autoResult.valid && autoResult.count > 1;
+
+  const handleNameChange = (i, v) => {
+    setSegmentNames((prev) => {
+      const next = [...prev];
+      next[i] = v;
+      return next;
+    });
+  };
 
   const submit = async (e) => {
-    e.preventDefault();
+    e?.preventDefault?.();
     setErr("");
-
-    if (!valid) {
-      setErr("Please adjust segments or breaks so total time fits.");
+    if (!autoResult.valid) {
+      setErr("Invalid segmentation — adjust parameters.");
       return;
     }
+    if (!canSplit) {
+      setErr("Nothing to split (only 1 segment).");
+      return;
+    }
+
     setSubmitting(true);
     try {
       const token = localStorage.getItem("token");
@@ -153,20 +219,12 @@ export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess })
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       };
 
-      const body =
-        mode === "byCount"
-          ? {
-              mode,
-              count: Number(count),
-              breakMinutes: Math.max(0, Number(breakMinutes) || 0),
-              titlePrefix: titlePrefix || undefined,
-            }
-          : {
-              mode,
-              segmentMinutes: Number(segmentMinutes),
-              breakMinutes: Math.max(0, Number(breakMinutes) || 0),
-              titlePrefix: titlePrefix || undefined,
-            };
+      const body = {
+        mode: "byCount",
+        count: autoResult.count,
+        breakMinutes: autoResult.perBreakMin || 0,
+        titlePrefix: titlePrefix || undefined,
+      };
 
       const res = await fetch(`${API_BASE}/events/${baseId(event._id)}/split`, {
         method: "POST",
@@ -174,10 +232,31 @@ export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess })
         credentials: "include",
         body: JSON.stringify(body),
       });
+
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Failed to split");
 
-      onSplitSuccess?.(data.segments || []);
+      const createdSegments = data.segments || [];
+
+      // Best-effort rename created children to match edited names
+      for (let i = 0; i < createdSegments.length; i++) {
+        const cs = createdSegments[i];
+        const wantTitle = segmentNames[i];
+        if (wantTitle && wantTitle.trim() && wantTitle.trim() !== cs.title) {
+          try {
+            await fetch(`${API_BASE}/events/${baseId(cs._id)}`, {
+              method: "PUT",
+              headers,
+              credentials: "include",
+              body: JSON.stringify({ title: wantTitle.trim() }),
+            });
+          } catch {
+            // ignore rename failure
+          }
+        }
+      }
+
+      onSplitSuccess?.(data.segments || createdSegments);
       onClose?.();
     } catch (e2) {
       setErr(e2.message || "Failed to split");
@@ -185,6 +264,8 @@ export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess })
       setSubmitting(false);
     }
   };
+
+  if (!isOpen || !event) return null;
 
   return (
     <div
@@ -194,126 +275,64 @@ export default function SegmentModal({ isOpen, onClose, event, onSplitSuccess })
       aria-modal="true"
       aria-labelledby="segment-modal-title"
     >
-      <div
-        ref={dialogRef}
-        className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <h2 id="segment-modal-title" className="text-lg font-semibold">
-          Segment “{event.title}”
+      <div ref={dialogRef} className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl" onMouseDown={(e) => e.stopPropagation()}>
+        <h2 id="segment-modal-title" className="text-lg font-semibold mb-2">
+          Auto Segment “{event.title}”
         </h2>
         <p className="text-sm text-gray-600 mb-3">
-          Total time selected: <b>{totalMin} min</b> (PH time).
+          Total time: <b>{totalMin} min</b> ({Math.round((totalMin / 60) * 100) / 100} hours).
         </p>
 
         <form onSubmit={submit} className="space-y-3">
-          <div className="flex flex-wrap gap-3">
-            <label className="flex items-center gap-1">
-              <input
-                type="radio"
-                name="mode"
-                value="byCount"
-                checked={mode === "byCount"}
-                onChange={() => setMode("byCount")}
-              />
-              <span className="text-sm">By number of segments</span>
-            </label>
-            <label className="flex items-center gap-1">
-              <input
-                type="radio"
-                name="mode"
-                value="byDuration"
-                checked={mode === "byDuration"}
-                onChange={() => setMode("byDuration")}
-              />
-              <span className="text-sm">By minutes per segment</span>
-            </label>
+          <div className="text-sm text-gray-700">
+            Computed segments: <b>{autoResult.count}</b>
           </div>
-
-          {mode === "byCount" ? (
-            <div>
-              <label className="block text-sm mb-1">How many segments?</label>
-              <input
-                type="number"
-                min={1}
-                className="w-full border rounded-lg p-2"
-                value={count}
-                onChange={(e) => setCount(e.target.value)}
-                required
-              />
-            </div>
-          ) : (
-            <div>
-              <label className="block text-sm mb-1">Minutes per segment</label>
-              <input
-                type="number"
-                min={1}
-                className="w-full border rounded-lg p-2"
-                value={segmentMinutes}
-                onChange={(e) => setSegmentMinutes(e.target.value)}
-                required
-              />
-            </div>
-          )}
-
-          <div>
-            <label className="block text-sm mb-1">Break between segments (min)</label>
-            <input
-              type="number"
-              min={0}
-              className="w-full border rounded-lg p-2"
-              value={breakMinutes}
-              onChange={(e) => setBreakMinutes(e.target.value)}
-            />
+          <div className="grid grid-cols-2 gap-2 text-xs text-gray-600">
+            <div>Per segment ≈ <b>{autoResult.segmentMinutes} min</b></div>
+            <div>Per break ≈ <b>{autoResult.perBreakMin} min</b></div>
+          </div>
+          <div className="text-xs text-gray-500 mt-1">
+            Difficulty factor: {autoResult.P ? autoResult.P : "—"}, urgency weight: {autoResult.Uweight ? autoResult.Uweight : "—"}
           </div>
 
           <div>
             <label className="block text-sm mb-1">Child title prefix (optional)</label>
-            <input
-              type="text"
-              className="w-full border rounded-lg p-2"
-              placeholder={event.title}
-              value={titlePrefix}
-              onChange={(e) => setTitlePrefix(e.target.value)}
-            />
+            <input type="text" className="w-full border rounded-lg p-2" placeholder={event.title} value={titlePrefix} onChange={(e) => setTitlePrefix(e.target.value)} />
           </div>
 
-          {/* Live preview / validation */}
-          <div
-            className={`text-sm rounded-lg p-2 ${
-              valid
-                ? "bg-green-50 text-green-700 border border-green-200"
-                : "bg-yellow-50 text-yellow-800 border border-yellow-200"
-            }`}
-          >
-            {preview}
-            {valid && computedCount > 0 && (
-              <div className="text-xs text-gray-500 mt-1">
-                {breakMinutes > 0
-                  ? `Includes ${breakMinutes} min break between segments.`
-                  : "No breaks between segments."}
+          {autoResult.segments && autoResult.segments.length > 0 && (
+            <div className="border rounded p-2 bg-gray-50">
+              <div className="text-sm font-semibold mb-2">Segment names</div>
+              <div className="space-y-2 max-h-48 overflow-auto">
+                {autoResult.segments.map((s, i) => (
+                  <div key={i} className="flex gap-2 items-center">
+                    <div className="w-8 text-xs text-gray-600">#{i + 1}</div>
+                    <input
+                      type="text"
+                      className="flex-1 border rounded p-1 text-sm"
+                      value={segmentNames[i] ?? s.title}
+                      onChange={(e) => handleNameChange(i, e.target.value)}
+                    />
+                    <div className="text-xs text-gray-500 w-24 text-right">{s.minutes}m</div>
+                  </div>
+                ))}
               </div>
-            )}
-          </div>
+            </div>
+          )}
 
           {err && <p className="text-sm text-red-600">{err}</p>}
 
           <div className="flex justify-end gap-2 pt-2">
-            <button
-              type="button"
-              className="px-3 py-1 rounded-lg border"
-              onClick={onClose}
-              disabled={submitting}
-            >
+            <button type="button" className="px-3 py-1 rounded-lg border" onClick={onClose} disabled={submitting}>
               Cancel
             </button>
             <button
               type="submit"
-              className="px-3 py-1 rounded-lg bg-purple-600 text-white disabled:opacity-60"
-              disabled={submitting || !valid}
-              title={!valid ? "Adjust segments/breaks to fit total time" : "Split event"}
+              className={`px-3 py-1 rounded-lg bg-purple-600 text-white disabled:opacity-60 ${!canSplit ? "opacity-60 cursor-not-allowed" : ""}`}
+              disabled={submitting || !canSplit}
+              title={!canSplit ? "Only one segment — nothing to split" : "Split event"}
             >
-              {submitting ? "Splitting…" : "Split"}
+              {submitting ? "Splitting…" : canSplit ? "Split" : "No Split (1 segment)"}
             </button>
           </div>
         </form>

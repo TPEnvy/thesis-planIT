@@ -1,5 +1,5 @@
 // src/pages/Schedule.jsx
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
@@ -9,8 +9,6 @@ import dayjs from "dayjs";
 import timezone from "dayjs/plugin/timezone";
 import utc from "dayjs/plugin/utc";
 import ShowModal from "../components/ShowModal";
-import ConflictModal from "../components/ConflictModal";
-import ShareModal from "../components/ShareModal";
 import SegmentModal from "../components/SegmentModal";
 import CreateConflictModal from "../components/CreateConflictModal";
 import useReminders from "../util/useReminder";
@@ -23,7 +21,6 @@ import {
   FiEdit2,
   FiTrash2,
   FiScissors,
-  FiShare2,
   FiCheckCircle,
   FiXCircle,
 } from "react-icons/fi";
@@ -34,16 +31,24 @@ dayjs.extend(timezone);
 const API_URL = "http://localhost:5000";
 const TZ = "Asia/Manila";
 
-// Strip virtual suffix like "68c...-2025"
+// When parent progress >= this fraction, auto-mark parent "completed"
+const THRESHOLD_COMPLETE = 0.6; // 60%
+
+// Helpers
 const baseId = (v = "") => {
   const s = String(v || "");
   return s.includes("-") ? s.split("-")[0] : s;
 };
 
-// Time-of-day grouping
-const getTimeBlock = (d) => {
-  const h = dayjs(d).hour();
-  if (h >= 5 && h < 12) return "Morning";
+// TIME BLOCK classification
+const getTimeBlock = (ev, selectedDate) => {
+  const dayStart = dayjs(selectedDate).startOf("day");
+  const dayEnd = dayjs(selectedDate).endOf("day");
+  const evStart = dayjs(ev.start);
+  const effective = evStart.isAfter(dayStart) ? evStart : dayStart;
+  const effectiveSafe = effective.isAfter(dayEnd) ? dayStart : effective;
+  const h = effectiveSafe.hour();
+  if (h >= 0 && h < 12) return "Morning";
   if (h >= 12 && h < 17) return "Afternoon";
   if (h >= 17 && h < 21) return "Evening";
   return "Night";
@@ -52,46 +57,100 @@ const getTimeBlock = (d) => {
 const formatRange = (ev) =>
   `${dayjs(ev.start).format("MMM D, YYYY h:mm A")} – ${dayjs(ev.end).format("h:mm A")}`;
 
-/* ===================== ADDED: Priority helpers ===================== */
-// Simple priority score: higher = more priority.
-// We weigh Importance more than Urgency, and give a small boost to nearer start times.
-// Completed/missed and already-ended are filtered OUT elsewhere and won’t get ranked.
+/* ===================== Priority helpers ===================== */
 function priorityScore(ev) {
   const imp = ev.importance === "high" ? 3 : 1;
   const urg = ev.urgency === "high" ? 2 : 1;
 
-  // Nearer start gets a tiny boost, but not dominant
   const now = dayjs().tz(TZ);
-  const minutesFromNow = Math.max(0, dayjs(ev.start).diff(now, "minute"));
+  const minutesFromNow = Math.max(0, dayjs(ev.start).tz(TZ).diff(now, "minute"));
   const proximityBoost = 1 / (1 + minutesFromNow / 60); // 0..1
 
-  // Difficulty nudges: easier slightly higher priority to start sooner
+  // Easier tasks get a slight bonus so you can knock them out quickly.
   const diffMap = { easy: 0.5, medium: 0.25, hard: 0 };
   const diffBonus = diffMap[String(ev.difficulty || "medium")] ?? 0.25;
 
   return imp * 2 + urg * 1.5 + proximityBoost + diffBonus;
 }
 
-// Color for the circular rank bubble based on score (just a visual cue)
 function scoreColor(score = 0) {
-  if (score >= 6) return "bg-red-600";       // top priority
-  if (score >= 5) return "bg-orange-600";    // high
-  if (score >= 4) return "bg-amber-600";     // medium-high
-  if (score >= 3) return "bg-blue-600";      // medium
-  return "bg-slate-500";                     // low/else
+  if (score >= 6) return "bg-red-600";
+  if (score >= 5) return "bg-orange-600";
+  if (score >= 4) return "bg-amber-600";
+  if (score >= 3) return "bg-blue-600";
+  return "bg-slate-500";
 }
-/* =================================================================== */
+/* ============================================================ */
+
+/* ===================== Tiny Toasts (no external deps) ===================== */
+function useToasts() {
+  const [toasts, setToasts] = useState([]);
+  const push = useCallback((toast) => {
+    const id = Math.random().toString(36).slice(2);
+    const t = { id, type: toast.type || "info", message: toast.message || "" };
+    setToasts((prev) => [...prev, t]);
+    // auto-hide after 3s
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((x) => x.id !== id));
+    }, 3000);
+  }, []);
+  const remove = useCallback((id) => {
+    setToasts((prev) => prev.filter((x) => x.id !== id));
+  }, []);
+  return { toasts, push, remove };
+}
+
+function ToastStack({ toasts, onClose }) {
+  return (
+    <div className="fixed bottom-4 right-4 z-[100] flex flex-col gap-2">
+      {toasts.map((t) => {
+        const colors =
+          t.type === "success"
+            ? "bg-emerald-600"
+            : t.type === "error"
+            ? "bg-rose-600"
+            : t.type === "warning"
+            ? "bg-amber-600"
+            : "bg-slate-700";
+        return (
+          <div
+            key={t.id}
+            className={`${colors} text-white shadow-lg rounded-lg px-4 py-3 flex items-start gap-3 max-w-xs`}
+          >
+            <div className="text-sm leading-snug">{t.message}</div>
+            <button
+              onClick={() => onClose(t.id)}
+              className="text-white/80 hover:text-white text-xs ml-auto"
+              title="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+/* ======================================================================== */
 
 export default function Schedule() {
   const [selectedDate, setSelectedDate] = useState(dayjs());
   const [events, setEvents] = useState([]);
-  const [doubleBookedIds, setDoubleBookedIds] = useState([]); // baseIds that are overlapping (owned vs owned)
-  const [overlapsWithOwnedIds, setOverlapsWithOwnedIds] = useState([]); // baseIds that overlap ANY event with my owned events
+
+  // 🔁 Live clock for time-based UI (updates every 30s)
+  const [now, setNow] = useState(dayjs());
+  useEffect(() => {
+    const id = setInterval(() => setNow(dayjs()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Only owned vs owned double-booking (exact-match)
+  const [doubleBookedIds, setDoubleBookedIds] = useState([]);
+
   const [showModal, setShowModal] = useState(false);
   const [editingEvent, setEditingEvent] = useState(null);
   const [formError, setFormError] = useState("");
   const [startTimePastError, setStartTimePastError] = useState("");
-  const [conflictEvent, setConflictEvent] = useState(null);
 
   // Create-time conflict modal (when POST /events returns 409)
   const [createConflict, setCreateConflict] = useState({
@@ -100,15 +159,12 @@ export default function Schedule() {
     newEvent: null,
   });
 
-  const [shareModalOpen, setShareModalOpen] = useState(false);
-  const [eventToShare, setEventToShare] = useState(null);
-
   const [segmentOpen, setSegmentOpen] = useState(false);
   const [segmentTarget, setSegmentTarget] = useState(null);
 
   // UI filters/search
   const [query, setQuery] = useState("");
-  const [view, setView] = useState("all"); // all | mine | pending | overlaps
+  const [view, setView] = useState("all"); // all | overlaps
   const [urgencyFilter, setUrgencyFilter] = useState("all"); // all | high | low
   const [importanceFilter, setImportanceFilter] = useState("all"); // all | high | low
 
@@ -123,11 +179,13 @@ export default function Schedule() {
 
   const user = JSON.parse(localStorage.getItem("user"));
   const { scheduleReminders, cancelRemindersFor, ensurePermission } = useReminders();
-  const scheduledThisRenderRef = useRef({});
+  const scheduledThisRenderRef = useRef({}); // keep
+  const autoCompletedRef = useRef(new Set());
 
-  const senderEmail = user?.email || "";
+  // ✅ Toasts
+  const { toasts, push, remove } = useToasts();
 
-  // Ask for Web Notification permission once
+  // ✅ Ask for notification permission on mount (kept)
   useEffect(() => {
     ensurePermission?.();
   }, [ensurePermission]);
@@ -138,183 +196,127 @@ export default function Schedule() {
     return s.isValid() && e.isValid() && e.isAfter(s);
   };
 
-  // Strip virtual suffix and return the real event object if we have it in state
-  const canonicalizeEvent = useCallback(
-    (ev) => {
-      if (!ev) return null;
-      const id = baseId(String(ev._id || "")); // e.g. "abc123-2025" -> "abc123"
-      return events.find((x) => String(x._id) === id) || ev;
-    },
-    [events]
-  );
-
-  // Birthday recurrence (virtual projection for selected year) — safe guard
-  const expandBirthday = (event, atDate) => {
-    if (!event || !event.title) return [];
-    if (!String(event.title).includes("Birthday 🎂")) return [event];
-    const selectedYear = dayjs(atDate).year();
-    const birthdayBase = dayjs(event.start);
-    const birthdayThisYear = birthdayBase.year(selectedYear);
-    return [
-      {
-        ...event,
-        _id: `${event._id}-${selectedYear}`,
-        start: birthdayThisYear.toDate(),
-        end: birthdayThisYear.endOf("day").toDate(),
-        isVirtual: true,
-      },
-    ];
-  };
-
-  // ===== Segmentation helpers =====
-  const parentIdsWithChildren = new Set(
-    events.filter((e) => e && e.segmentOf).map((e) => String(e.segmentOf))
-  );
-
-  // Show ALL events (parents remain visible even when segmented)
+  // Show ALL events that overlap the selected day
   const dayStart = dayjs(selectedDate).startOf("day");
   const dayEnd = dayjs(selectedDate).endOf("day");
 
-  const filteredUpcomingEvents = events
-    .flatMap((ev) => expandBirthday(ev, selectedDate))
-    // show if the event overlaps the selected day at all:
-    // (event.start < dayEnd) AND (event.end > dayStart)
-    .filter(
-      (ev) =>
-        ev &&
-        dayjs(ev.start).isBefore(dayEnd) &&
-        dayjs(ev.end).isAfter(dayStart)
-    )
-    .filter((ev) => !["completed", "missed"].includes(ev.status))
-    .sort((a, b) => new Date(a.start) - new Date(b.start));
+  const filteredUpcomingEvents = useMemo(
+    () =>
+      events
+        .filter((ev) => ev)
+        .filter((ev) => dayjs(ev.start).isBefore(dayEnd) && dayjs(ev.end).isAfter(dayStart))
+        .filter((ev) => !["completed", "missed"].includes(ev.status))
+        .sort((a, b) => {
+          // primary: start time
+          const byStart = new Date(a.start) - new Date(b.start);
+          if (byStart !== 0) return byStart;
 
+          // secondary: parents before children when same start
+          const aIsChild = !!a.segmentOf;
+          const bIsChild = !!b.segmentOf;
+          if (aIsChild !== bIsChild) return aIsChild ? 1 : -1;
 
-  /* ===================== ADDED: Rank ongoing + upcoming only ===================== */
-  /* ===================== REPLACE your current ranking block with this ===================== */
-    /* Rank ongoing + upcoming only, but give the SAME rank to overlapping events */
-    const scoreMap = new Map();
-    const rankMap = new Map();
-    const nowTz = dayjs().tz(TZ);
+          // tertiary: if both children of same parent, order by segmentIndex
+          if (
+            a.segmentOf &&
+            b.segmentOf &&
+            String(a.segmentOf).split("-")[0] === String(b.segmentOf).split("-")[0]
+          ) {
+            const ai =
+              typeof a.segmentIndex === "number" ? a.segmentIndex : Number.MAX_SAFE_INTEGER;
+            const bi =
+              typeof b.segmentIndex === "number" ? b.segmentIndex : Number.MAX_SAFE_INTEGER;
+            return ai - bi;
+          }
 
-    // Only rank events whose END is in the future (ongoing or upcoming).
-    const rankPool = filteredUpcomingEvents
-      .filter((ev) => dayjs(ev.end).isAfter(nowTz))
-      .map((ev) => ({
-        ev,
-        startMs: +new Date(ev.start),
-        endMs: +new Date(ev.end),
-        score: priorityScore(ev),
-      }))
-      // Higher score first, then earlier start time
-      .sort((a, b) => b.score - a.score || a.startMs - b.startMs);
+          // final fallback: end time
+          return new Date(a.end) - new Date(b.end);
+        }),
+    [events, dayStart, dayEnd]
+  );
 
-    // Build overlap groups: if an item overlaps a group's span, it joins that group.
-    // Groups merge implicitly because we expand the group's time span when adding items.
-    const groups = [];
-    for (const item of rankPool) {
-      let placed = false;
-      for (const g of groups) {
-        const overlaps = item.startMs < g.maxEnd && item.endMs > g.minStart;
-        if (overlaps) {
-          g.items.push(item);
-          g.minStart = Math.min(g.minStart, item.startMs);
-          g.maxEnd = Math.max(g.maxEnd, item.endMs);
-          g.bestScore = Math.max(g.bestScore, item.score);
-          placed = true;
-          break;
-        }
-      }
-      if (!placed) {
-        groups.push({
-          items: [item],
-          minStart: item.startMs,
-          maxEnd: item.endMs,
-          bestScore: item.score,
-        });
+  /* ----------------- Build children map EARLY (used by ordering) ----------------- */
+  const childrenByParent = useMemo(() => {
+    const map = new Map();
+    for (const e of events) {
+      if (e?.segmentOf) {
+        const pid = baseId(String(e.segmentOf));
+        if (!map.has(pid)) map.set(pid, []);
+        map.get(pid).push(e);
       }
     }
+    for (const arr of map.values()) {
+      arr.sort((a, b) => new Date(a.start) - new Date(b.start));
+    }
+    return map;
+  }, [events]);
 
-    // Order groups by best (highest) score; tie-break by earliest start
-    groups.sort((a, b) => b.bestScore - a.bestScore || a.minStart - b.minStart);
+  const parentIdsWithChildren = useMemo(
+    () => new Set(Array.from(childrenByParent.keys())),
+    [childrenByParent]
+  );
 
-    // Assign ranks per group; every event in the same group gets the SAME rank number
-    groups.forEach((g, idx) => {
-      const rank = idx + 1;
-      g.items.forEach(({ ev, score }) => {
-        const id = baseId(ev._id);
-        scoreMap.set(id, score);
-        rankMap.set(id, rank);
-      });
-    });
-/* ======================================================================================= */
+  /* ========== Compute priority score & unique priority order numbering ========== */
+  const scoreMap = new Map();
+  const orderMap = new Map(); // unique sequential order (1,2,3,...)
 
-  // ================== FETCH OWNED/SHARED EVENTS ==================
-  const fetchOwnedAndShared = useCallback(async (userId) => {
+  // Give an order number to every standalone event AND every child event.
+  // Parents that have children are excluded from the ordering.
+  const orderingPool = filteredUpcomingEvents
+    .filter((ev) => {
+      const evBase = baseId(String(ev._id));
+      if (!ev.segmentOf && parentIdsWithChildren.has(evBase)) return false; // exclude parent from numbering
+      return true; // include standalone or child
+    })
+    .map((ev) => ({
+      ev,
+      score: priorityScore(ev),
+      startMs: +new Date(ev.start),
+    }));
+
+  // Sort strictly by score desc, then start asc to break ties
+  orderingPool.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.startMs - b.startMs;
+  });
+
+  // Assign unique sequential priority order numbers
+  orderingPool.forEach((item, idx) => {
+    const id = baseId(item.ev._id);
+    scoreMap.set(id, item.score);
+    orderMap.set(id, idx + 1); // 1-based unique numbering
+  });
+  /* ============================================================================ */
+
+  // ================== FETCH OWNED EVENTS ==================
+  const fetchEvents = useCallback(async (userId) => {
     const res = await fetch(`${API_URL}/events/${userId}`);
     const data = await res.json();
-
-    return data.map((ev) => {
-      if (String(ev.userId) === String(userId)) {
-        return { ...ev, shareStatus: ev.shareStatus || {} };
-      }
-      return ev;
-    });
+    return data;
   }, []);
 
-  // ================== FETCH PENDING INCOMING REQUESTS ==================
-  const fetchIncomingVirtuals = useCallback(async (userId) => {
-    const res = await fetch(`${API_URL}/share-requests/incoming/${userId}?status=pending`);
-    const requests = await res.json();
-
-    return (requests || [])
-      .filter((r) => r?.eventId)
-      .map((r) => {
-        const ev = r.eventId;
-        return {
-          ...ev,
-          _id: `virt_${r._id}`, // virtual id; won't collide with baseId logic
-          isShared: true,
-          shareStatus: "pending",
-          shareRequestId: r._id,
-          userName: r?.senderId?.fullname || "Someone",
-        };
-      });
-  }, []);
-
-  // ================== MASTER FETCH ==================
   const refreshAll = useCallback(async () => {
     if (!user?.id) return;
     try {
-      const [ownedShared, incomingVirtuals] = await Promise.all([
-        fetchOwnedAndShared(user.id),
-        fetchIncomingVirtuals(user.id),
-      ]);
-
-      const byId = {};
-      [...ownedShared, ...incomingVirtuals].forEach((e) => {
-        byId[e._id] = e;
-      });
-
-      setEvents(Object.values(byId));
+      const owned = await fetchEvents(user.id);
+      setEvents(owned);
     } catch (err) {
       console.error("Failed to refresh events:", err);
+      push({ type: "error", message: "Failed to refresh events." });
     }
-  }, [user?.id, fetchOwnedAndShared, fetchIncomingVirtuals]);
+  }, [user?.id, fetchEvents, push]);
 
   useEffect(() => {
     refreshAll();
   }, [refreshAll]);
 
-  // ================== DOUBLE-BOOK DETECTION ==================
-
+  // ================== EXACT-MATCH DOUBLE-BOOK DETECTION ==================
   useEffect(() => {
     if (!user?.id || !events.length) {
       setDoubleBookedIds([]);
-      setOverlapsWithOwnedIds([]);
       return;
     }
 
-    // Two events are from the same segmented "family" if:
     const sameFamily = (x, y) => {
       if (!x || !y) return false;
       const xid = baseId(String(x._id || ""));
@@ -323,19 +325,15 @@ export default function Schedule() {
       const yParent = y.segmentOf ? baseId(String(y.segmentOf)) : null;
 
       return (
-        xid === yid || // same event
-        (xParent && xParent === yid) || // x child of y (y is parent)
-        (yParent && yParent === xid) || // y child of x (x is parent)
-        (xParent && yParent && xParent === yParent) // siblings (same parent)
+        xid === yid ||
+        (xParent && xParent === yid) ||
+        (yParent && yParent === xid) ||
+        (xParent && yParent && xParent === yParent)
       );
     };
 
-    // Owned events only (no virtual, no shared, no completed/missed)
     const owned = events
-      .filter(
-        (e) =>
-          String(e.userId) === String(user.id) && !e?.isVirtual && !e?.isShared && !e?.status
-      )
+      .filter((e) => String(e.userId) === String(user.id) && !e?.isVirtual && !e?.status)
       .map((e) => ({
         id: baseId(e._id),
         _id: String(e._id),
@@ -345,46 +343,25 @@ export default function Schedule() {
       }))
       .sort((a, b) => a.start - b.start);
 
-    // 1) Owned vs Owned overlaps (skip same-family)
-    const ownedOwnedFlags = new Set();
+    const flags = new Set();
     for (let i = 0; i < owned.length; i++) {
       for (let j = i + 1; j < owned.length; j++) {
         const A = owned[i];
         const B = owned[j];
-        if (B.start >= A.end) break; // sorted by start; no further overlaps
+        if (B.start > A.end) break;
         if (sameFamily(A.ref, B.ref)) continue;
-        if (A.start < B.end && A.end > B.start) {
-          ownedOwnedFlags.add(A.id);
-          ownedOwnedFlags.add(B.id);
+
+        // ✅ Only flag when BOTH start and end are EXACTLY the same
+        if (A.start === B.start && A.end === B.end) {
+          flags.add(A.id);
+          flags.add(B.id);
         }
       }
     }
-    setDoubleBookedIds(Array.from(ownedOwnedFlags));
-
-    // 2) ANY event vs Owned overlaps (covers pending shares & "keep both"), skip same-family
-    const overlapsAny = new Set();
-    for (const cand of events) {
-      if (!cand || cand.status) continue; // ignore completed/missed
-      const cStart = new Date(cand.start).getTime();
-      const cEnd = new Date(cand.end).getTime();
-      const cId = baseId(cand._id);
-
-      for (const own of owned) {
-        if (sameFamily(own.ref, cand)) continue;
-        if (cStart < own.end && cEnd > own.start) {
-          overlapsAny.add(cId);
-          break;
-        }
-      }
-    }
-    setOverlapsWithOwnedIds(Array.from(overlapsAny));
+    setDoubleBookedIds(Array.from(flags));
   }, [events, user?.id]);
 
-  // Use BOTH sets to decide if we show the warning badge
-  const isDoubleBooked = (event) => {
-    const id = baseId(event._id);
-    return doubleBookedIds.includes(id) || overlapsWithOwnedIds.includes(id);
-  };
+  const isDoubleBooked = (event) => doubleBookedIds.includes(baseId(event._id));
 
   // ================== VALIDATION ==================
   useEffect(() => {
@@ -393,11 +370,11 @@ export default function Schedule() {
       return;
     }
     const phNow = dayjs().tz(TZ);
-    const startTime = dayjs(form.start);
-    const endTime = form.end ? dayjs(form.end) : null;
+    const startTime = dayjs(form.start).tz(TZ);
+    const endTime = form.end ? dayjs(form.end).tz(TZ) : null;
 
     if (editingEvent) {
-      const originalStart = dayjs(editingEvent.start);
+      const originalStart = dayjs(editingEvent.start).tz(TZ);
       setStartTimePastError(
         startTime.isBefore(originalStart)
           ? `❌ Start time cannot be earlier than the original (${originalStart.format(
@@ -422,14 +399,14 @@ export default function Schedule() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     const phNow = dayjs().tz(TZ);
-    const startTime = dayjs(form.start);
-    const endTime = dayjs(form.end);
+    const startTime = dayjs(form.start).tz(TZ);
+    const endTime = dayjs(form.end).tz(TZ);
 
-    if (editingEvent && startTime.isBefore(dayjs(editingEvent.start))) {
+    if (editingEvent && startTime.isBefore(dayjs(editingEvent.start).tz(TZ))) {
       setStartTimePastError(
-        `❌ Start time cannot be earlier than original (${dayjs(editingEvent.start).format(
-          "MMM D, YYYY h:mm A"
-        )})`
+        `❌ Start time cannot be earlier than original (${dayjs(editingEvent.start)
+          .tz(TZ)
+          .format("MMM D, YYYY h:mm A")})`
       );
       return;
     }
@@ -459,13 +436,10 @@ export default function Schedule() {
         const updated = await res.json();
         if (!res.ok) throw new Error(updated?.error || "Failed to update event");
         setEvents((prev) =>
-          prev.map((ev) =>
-            baseId(ev._id) === baseId(updated._id)
-              ? { ...updated, shareStatus: ev.shareStatus || "pending" }
-              : ev
-          )
+          prev.map((ev) => (baseId(ev._id) === baseId(updated._id) ? updated : ev))
         );
         cancelRemindersFor(baseId(updated._id));
+        push({ type: "success", message: "Event updated." });
         closeModal();
         return;
       }
@@ -478,26 +452,26 @@ export default function Schedule() {
       });
 
       if (res.status === 409) {
-        // Server-side conflict → open CreateConflictModal
+        // Server-side exact duplicate → open CreateConflictModal WITH newEvent object
         const data = await res.json().catch(() => ({}));
         setCreateConflict({
           open: true,
           conflicts: data?.conflict ? [data.conflict] : [],
-          newEvent: payload,
+          newEvent: payload, // <-- pass full payload so modal can compute suggestions
         });
+        push({ type: "warning", message: "Exact duplicate detected. Choose an action." });
         return;
       }
 
       const newEvent = await res.json();
       if (!res.ok) throw new Error(newEvent?.error || "Failed to create event");
 
-      setEvents((prev) => [
-        ...prev,
-        { ...newEvent, shareStatus: newEvent.shareStatus || "pending" },
-      ]);
+      setEvents((prev) => [...prev, newEvent]);
+      push({ type: "success", message: "Event created." });
       closeModal();
     } catch (err) {
       console.error(err);
+      push({ type: "error", message: err.message || "Failed to save event." });
       alert(err.message || "Failed to save event");
     }
   };
@@ -506,91 +480,65 @@ export default function Schedule() {
   const handleDelete = async (id) => {
     try {
       const cleanId = baseId(id);
-      await fetch(`${API_URL}/events/${cleanId}`, { method: "DELETE" });
+      const res = await fetch(`${API_URL}/events/${cleanId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.error || "Failed to delete event");
+      }
       setEvents((prev) => prev.filter((ev) => baseId(ev._id) !== cleanId));
       cancelRemindersFor(cleanId);
+      push({ type: "success", message: "Event deleted." });
     } catch (err) {
       console.error(err);
+      push({ type: "error", message: err.message || "Failed to delete event." });
     }
   };
 
   // ================== STATUS ==================
-  const markStatus = async (id, status) => {
-    try {
-      const cleanId = baseId(id);
-      const res = await fetch(`${API_URL}/events/${cleanId}/status`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
-      });
-      const result = await res.json();
-      if (!res.ok) throw new Error(result.error || "Failed to update status");
+  const markStatus = useCallback(
+    async (id, status) => {
+      try {
+        const cleanId = baseId(id);
+        const res = await fetch(`${API_URL}/events/${cleanId}/status`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status }),
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.error || "Failed to update status");
 
-      setEvents((prev) => {
-        // 1) Update the target event
-        let next = prev.map((ev) =>
-          baseId(ev._id) === cleanId ? { ...ev, status: result.status } : ev
-        );
-
-        // 2) If a child completed the parent, reflect on parent
-        if (result.parentUpdated && result.parent) {
-          const pid = baseId(result.parent._id);
-          next = next.map((ev) =>
-            baseId(ev._id) === pid ? { ...ev, status: result.parent.status } : ev
+        setEvents((prev) => {
+          let next = prev.map((ev) =>
+            baseId(ev._id) === cleanId ? { ...ev, status: result.status } : ev
           );
-        }
 
-        // 3) If a parent completed its children, reflect on children
-        if (Array.isArray(result.updatedChildIds) && result.updatedChildIds.length) {
-          const idSet = new Set(result.updatedChildIds.map((x) => baseId(String(x))));
-          next = next.map((ev) =>
-            idSet.has(baseId(ev._id)) ? { ...ev, status: "completed" } : ev
-          );
-        }
+          // If parent got finalized by the server, reflect it so UI hides it
+          if (result.parentUpdated && result.parent) {
+            const pid = baseId(result.parent._id);
+            next = next.map((ev) =>
+              baseId(ev._id) === pid ? { ...ev, status: result.parent.status } : ev
+            );
+          }
 
-        return next;
-      });
+        // toast based on action
+          push({
+            type: status === "completed" ? "success" : "warning",
+            message:
+              status === "completed" ? "Marked as completed." : "Marked as missed.",
+          });
 
-      // Stop reminders on the event we directly updated
-      cancelRemindersFor(cleanId);
+          return next;
+        });
 
-      // If we cascaded to children, clear their reminders too
-      if (Array.isArray(result.updatedChildIds)) {
-        result.updatedChildIds.forEach((cid) => cancelRemindersFor(baseId(String(cid))));
+        cancelRemindersFor(cleanId);
+      } catch (err) {
+        console.error("Failed to update status", err);
+        push({ type: "error", message: err.message || "Failed to update status." });
+        alert(err.message || "Failed to update status");
       }
-    } catch (err) {
-      console.error("Failed to update status", err);
-      alert(err.message || "Failed to update status");
-    }
-  };
-
-  // ================== RECIPIENT RESPONSE (UNIFIED) ==================
-  const handleRecipientChoice = async (requestIdOrEventId, choice) => {
-    try {
-      const idForPath = requestIdOrEventId;
-      const res = await fetch(`${API_URL}/share-requests/${idForPath}/respond`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ choice }), // "keep" | "decline" | "replace"
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to respond");
-
-      // Remove the virtual incoming item
-      setEvents((prev) => prev.filter((ev) => ev.shareRequestId !== idForPath));
-
-      // If server created an event (keep/replace), add it and refresh
-      if (data?.event) {
-        setEvents((prev) => [...prev, data.event]);
-      }
-
-      await refreshAll();
-    } catch (err) {
-      console.error("❌ Error handling recipient choice:", err);
-      alert(err.message || "Failed to respond");
-    }
-  };
+    },
+    [cancelRemindersFor, push]
+  );
 
   // ================== MODALS ==================
   const openModal = (event = null) => {
@@ -630,67 +578,69 @@ export default function Schedule() {
     });
     setFormError("");
     setStartTimePastError("");
-    setConflictEvent(null);
     setEditingEvent(null);
   };
 
-  // ================== SHARE ==================
-  const handleOpenShare = (event) => {
-    const clean = { ...event, _id: baseId(event._id) };
-    setEventToShare(clean);
-    setShareModalOpen(true);
-  };
+  // ----------------- Segment relations & progress -----------------
+  const parentProgress = useMemo(() => {
+    const out = new Map();
+    for (const [pid, arr] of childrenByParent.entries()) {
+      const k = arr.length || 1;
+      const done = arr.filter((c) => c.status === "completed").length;
+      out.set(pid, done / k);
+    }
+    return out;
+  }, [childrenByParent]);
 
-  const handleSharedEvent = () => {
-    refreshAll();
-  };
-
-  // ✅ Auto conflict modal (recipient only) — includes requestId for actions
+  // Auto-mark parent completed (UX helper) when threshold hit
   useEffect(() => {
-    if (!user) return;
-
-    const pendingSharedEvent = events.find(
-      (ev) => ev.isShared && ev.userId !== user.id && ev.shareStatus === "pending"
-    );
-
-    if (pendingSharedEvent) {
-      const conflict = events.find(
-        (e) =>
-          e.userId === user.id &&
-          dayjs(e.start).isBefore(dayjs(pendingSharedEvent.end)) &&
-          dayjs(e.end).isAfter(dayjs(pendingSharedEvent.start))
-      );
-
-      if (conflict) {
-        setConflictEvent({
-          incoming: pendingSharedEvent,
-          existing: conflict,
-          requestId: pendingSharedEvent.shareRequestId,
-        });
+    if (!events.length) return;
+    for (const pid of parentIdsWithChildren) {
+      if (autoCompletedRef.current.has(pid)) continue;
+      const progress = parentProgress.get(pid) ?? 0;
+      if (progress >= THRESHOLD_COMPLETE) {
+        const parent = events.find((e) => baseId(String(e._id)) === pid && !e.segmentOf);
+        if (parent && !parent.status) {
+          autoCompletedRef.current.add(pid);
+          markStatus(pid, "completed");
+        }
       }
     }
-  }, [events, user]);
+  }, [parentIdsWithChildren, parentProgress, events, markStatus]);
 
-  // ================== REMINDERS ==================
-  filteredUpcomingEvents.forEach((event) => {
-    if (
-      !event.isVirtual &&
-      !event.isShared &&
-      !event.status &&
-      !parentIdsWithChildren.has(baseId(String(event._id))) && // don't notify a parent if it has segments
-      !scheduledThisRenderRef.current[baseId(event._id)]
-    ) {
-      scheduleReminders(event);
-      scheduledThisRenderRef.current[baseId(event._id)] = true;
-    }
-  });
+  // ✅ Schedule reminders for *eligible* events and avoid duplicates this render
+  useEffect(() => {
+    if (!scheduleReminders) return;
+    if (!filteredUpcomingEvents.length) return;
+
+    filteredUpcomingEvents.forEach((evt) => {
+      const id = baseId(String(evt._id));
+      // skip parents that have children; skip finalized items
+      if (parentIdsWithChildren.has(id)) return;
+      if (evt.status) return;
+
+      if (!scheduledThisRenderRef.current[id]) {
+        scheduleReminders(evt);
+        scheduledThisRenderRef.current[id] = true;
+      }
+    });
+    // no cleanup needed; reminders are one-shot per event id
+  }, [filteredUpcomingEvents, parentIdsWithChildren, scheduleReminders]);
 
   // ================== SEGMENTING ==================
+  const canonicalizeEvent = useCallback(
+    (ev) => {
+      if (!ev) return null;
+      const id = baseId(String(ev._id || ""));
+      return events.find((x) => String(x._id) === id) || ev;
+    },
+    [events]
+  );
+
   const openSegment = (ev) => {
     const real = canonicalizeEvent(ev);
-    // FIX: block invalid/shared/virtual/zero-duration
-    if (!real || real.isVirtual || real.isShared || !hasValidDuration(real)) {
-      alert("This event can't be segmented: invalid/shared/virtual/zero duration.");
+    if (!real || real.isVirtual || !hasValidDuration(real)) {
+      alert("This event can't be segmented: invalid/virtual/zero duration.");
       return;
     }
     setSegmentTarget(real);
@@ -709,25 +659,54 @@ export default function Schedule() {
       const others = prev.filter((e) => baseId(e._id) !== parentId);
       return keepParent ? [...others, keepParent, ...insertedSegments] : [...prev, ...insertedSegments];
     });
+    push({ type: "success", message: "Segments created." });
     closeSegment();
   };
 
-  const disablePastDates = (date) => dayjs(date).isBefore(dayjs(), "day");
-  const canSegmentEvent = (ev) =>
-    !ev.isVirtual && !ev.isShared && hasValidDuration(ev) && dayjs(ev.end).diff(dayjs(ev.start), "minute") >= 60;
+  const canSegmentEvent = (ev) => {
+    if (!ev) return false;
+    if (ev.segmentOf) return false;
+    if (parentIdsWithChildren.has(baseId(String(ev._id)))) return false;
+    if (!hasValidDuration(ev)) return false;
+    if (dayjs(ev.end).diff(dayjs(ev.start), "minute") < 180) return false;
+    return true;
+  };
 
   // ------- Derived: Today counters & filtered view -------
-  // Stats should NOT count parents that have children
-  const statsSource = filteredUpcomingEvents.filter(
-    (e) => !parentIdsWithChildren.has(baseId(String(e._id)))
-  );
+  const groupByOwner = useMemo(() => {
+    const map = new Map();
+    for (const ev of filteredUpcomingEvents) {
+      const owner = ev.segmentOf ? baseId(String(ev.segmentOf)) : baseId(String(ev._id));
+      if (!map.has(owner)) map.set(owner, []);
+      map.get(owner).push(ev);
+    }
+    return map;
+  }, [filteredUpcomingEvents]);
 
-  const todayCount = statsSource.length;
-  const overlapsCount = statsSource.filter((e) => isDoubleBooked(e)).length;
-  const pendingCount = filteredUpcomingEvents.filter(
-    (e) => e.isShared && e.shareStatus === "pending"
-  ).length;
+  const ownerList = useMemo(() => {
+    const out = [];
+    for (const [ownerId, arr] of groupByOwner.entries()) {
+      const children = arr.filter((x) => x.segmentOf && baseId(String(x.segmentOf)) === ownerId);
+      const parent = arr.find((x) => !x.segmentOf && baseId(String(x._id)) === ownerId);
+      const representative = parent || arr[0];
+      out.push({
+        ownerId,
+        parent,
+        children,
+        representative,
+        isParent: children.length > 0,
+      });
+    }
+    return out;
+  }, [groupByOwner]);
 
+  const todayCount = ownerList.length;
+
+  const overlapsCount = ownerList.filter((g) => {
+    return g.representative && isDoubleBooked(g.representative);
+  }).length;
+
+  // Build filtered "visible" list for rendering (render individual events)
   let visible = [...filteredUpcomingEvents];
 
   if (query.trim()) {
@@ -735,11 +714,7 @@ export default function Schedule() {
     visible = visible.filter((e) => String(e.title || "").toLowerCase().includes(q));
   }
 
-  if (view === "mine") {
-    visible = visible.filter((e) => String(e.userId) === String(user?.id) && !e.isShared);
-  } else if (view === "pending") {
-    visible = visible.filter((e) => e.isShared && e.shareStatus === "pending");
-  } else if (view === "overlaps") {
+  if (view === "overlaps") {
     visible = visible.filter((e) => isDoubleBooked(e));
   }
 
@@ -750,9 +725,8 @@ export default function Schedule() {
     visible = visible.filter((e) => e.importance === importanceFilter);
   }
 
-  // Group by time blocks
   const grouped = visible.reduce((acc, ev) => {
-    const blk = getTimeBlock(ev.start);
+    const blk = getTimeBlock(ev, selectedDate);
     (acc[blk] = acc[blk] || []).push(ev);
     return acc;
   }, {});
@@ -762,9 +736,9 @@ export default function Schedule() {
     try {
       const c = createConflict.conflicts?.[0];
       const candidate = createConflict.newEvent;
-      if (!c || !candidate) return setCreateConflict({ open: false, conflicts: [], newEvent: null });
+      if (!c || !candidate)
+        return setCreateConflict({ open: false, conflicts: [], newEvent: null });
 
-      // Replace = delete the conflicting event then create the new one
       await fetch(`${API_URL}/events/${baseId(c._id)}`, { method: "DELETE" });
 
       const res = await fetch(`${API_URL}/events`, {
@@ -777,8 +751,10 @@ export default function Schedule() {
 
       setCreateConflict({ open: false, conflicts: [], newEvent: null });
       setEvents((prev) => [...prev, data]);
+      push({ type: "success", message: "Replaced with new event." });
       refreshAll();
     } catch (err) {
+      push({ type: "error", message: err.message || "Failed to replace." });
       alert(err.message || "Failed to replace");
     }
   };
@@ -791,7 +767,6 @@ export default function Schedule() {
         return;
       }
 
-      // Re-post with allowDouble: true
       const res = await fetch(`${API_URL}/events`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -801,18 +776,17 @@ export default function Schedule() {
       if (!res.ok) throw new Error(data?.error || "Failed to create event");
 
       setCreateConflict({ open: false, conflicts: [], newEvent: null });
-
-      // Add locally, then refresh so overlap warnings recalc
       setEvents((prev) => [...prev, data]);
+      push({ type: "success", message: "Kept both events." });
       await refreshAll();
     } catch (err) {
+      push({ type: "error", message: err.message || "Failed to keep both." });
       alert(err.message || "Failed to keep both");
     }
   };
 
   const handleCreateReschedule = (slot) => {
     if (!slot?.start || !slot?.end) return;
-    // Pre-fill the form with the suggested slot and reopen the add modal
     setCreateConflict({ open: false, conflicts: [], newEvent: null });
     setEditingEvent(null);
     setForm((prev) => ({
@@ -821,8 +795,44 @@ export default function Schedule() {
       end: dayjs(slot.end).format("YYYY-MM-DDTHH:mm"),
     }));
     setShowModal(true);
+    push({ type: "info", message: "Suggestion applied. Adjust if needed." });
   };
 
+  const ProgressBar = ({ fraction }) => {
+    const pct = Math.round(Math.max(0, Math.min(1, fraction)) * 100);
+    return (
+      <div className="mt-2">
+        <div className="w-full h-2 rounded-full bg-slate-200 overflow-hidden">
+          <div className="h-2 bg-emerald-600 transition-all" style={{ width: `${pct}%` }} />
+        </div>
+        <div className="text-xs text-slate-600 mt-1">{pct}% complete</div>
+      </div>
+    );
+  };
+
+  const SegmentChips = ({ childrenList = [] }) => {
+    if (!childrenList.length) return null;
+    return (
+      <div className="flex flex-wrap gap-1 mt-2">
+        {childrenList.map((c, i) => {
+          const st = c.status || "pending";
+          const color =
+            st === "completed"
+              ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+              : st === "missed"
+              ? "bg-rose-100 text-rose-700 border-rose-200"
+              : "bg-slate-100 text-slate-700 border-slate-200";
+          return (
+            <span key={c._id || i} className={`text-[11px] px-2 py-0.5 rounded-full border ${color}`}>
+              Seg {typeof c.segmentIndex === "number" ? c.segmentIndex + 1 : i + 1} · {st}
+            </span>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ================== RENDER ==================
   return (
     <div className="flex flex-col min-h-screen bg-gradient-to-br from-green-200 to-green-50">
       <Navbar />
@@ -834,16 +844,20 @@ export default function Schedule() {
               <div className="flex items-center justify-between mb-3">
                 <h2 className="font-bold text-xl text-green-900">Calendar</h2>
                 <span className="text-xs text-gray-500">
-                  PH time · {dayjs().tz(TZ).format("MMM D, YYYY h:mm A")}
+                  PH time · {now.tz(TZ).format("MMM D, YYYY h:mm A")}
                 </span>
               </div>
 
               <LocalizationProvider dateAdapter={AdapterDayjs}>
-                <DateCalendar value={selectedDate} onChange={setSelectedDate} shouldDisableDate={disablePastDates} />
+                <DateCalendar
+                  value={selectedDate}
+                  onChange={setSelectedDate}
+                  shouldDisableDate={(d) => dayjs(d).isBefore(dayjs(), "day")}
+                />
               </LocalizationProvider>
 
               {/* Quick Stats */}
-              <div className="grid grid-cols-3 gap-3 mt-2">
+              <div className="grid grid-cols-2 gap-3 mt-2">
                 <div className="rounded-xl border border-green-100 bg-green-50 p-3 text-center">
                   <div className="text-xs text-gray-500">Today</div>
                   <div className="text-xl font-bold text-green-700">{todayCount}</div>
@@ -852,17 +866,13 @@ export default function Schedule() {
                   <div className="text-xs text-gray-500">Overlaps</div>
                   <div className="text-xl font-bold text-amber-700">{overlapsCount}</div>
                 </div>
-                <div className="rounded-xl border border-blue-100 bg-blue-50 p-3 text-center">
-                  <div className="text-xs text-gray-500">Pending</div>
-                  <div className="text-xl font-bold text-blue-700">{pendingCount}</div>
-                </div>
               </div>
 
               <button
                 onClick={() => openModal()}
-                disabled={disablePastDates(selectedDate)}
+                disabled={dayjs(selectedDate).isBefore(dayjs(), "day")}
                 className={`mt-4 w-full py-2 rounded-xl font-semibold text-white transition-colors duration-200 ${
-                  disablePastDates(selectedDate)
+                  dayjs(selectedDate).isBefore(dayjs(), "day")
                     ? "bg-gray-400 cursor-not-allowed"
                     : "bg-green-700 hover:bg-green-800"
                 }`}
@@ -891,7 +901,7 @@ export default function Schedule() {
           {/* Right: Filters + Grouped List */}
           <div className="md:col-span-7 lg:col-span-8">
             <div className="bg-white rounded-2xl shadow-xl p-4 sm:p-6">
-              {/* Sticky header for date + filters */}
+              {/* Sticky header */}
               <div className="sticky top-0 bg-white/80 backdrop-blur z-10 -mx-4 sm:-mx-6 px-4 sm:px-6 py-3 border-b">
                 <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
                   <div>
@@ -915,7 +925,7 @@ export default function Schedule() {
 
                     {/* View Filter */}
                     <div className="flex items-center gap-1 bg-gray-50 border rounded-lg p-1">
-                      {["all", "mine", "pending", "overlaps"].map((v) => (
+                      {["all", "overlaps"].map((v) => (
                         <button
                           key={v}
                           onClick={() => setView(v)}
@@ -976,24 +986,19 @@ export default function Schedule() {
                         </h3>
                         <ul className="space-y-3">
                           {(grouped[block] || []).map((event) => {
-                            const allowSegment = canSegmentEvent(event);
-                            const isIncomingPending =
-                              !!event.isShared && event.shareStatus === "pending";
-                            const showOverlapWarning = isDoubleBooked(event);
-                            const isSegmentChild = !!event.segmentOf;
-                            const now = dayjs().tz(TZ);
                             const isOngoing =
-                              now.isAfter(dayjs(event.start)) && now.isBefore(dayjs(event.end));
+                              now.tz(TZ).isAfter(dayjs(event.start).tz(TZ)) &&
+                              now.tz(TZ).isBefore(dayjs(event.end).tz(TZ));
 
-                            // -------------------- ADDED: read rank & score for this event
                             const eid = baseId(event._id);
-                            const rk = rankMap.get(eid);
-                            const sc =
-                              typeof rk === "number"
-                                ? scoreMap.get(eid) ?? priorityScore(event)
-                                : null;
-                            const showRank = typeof rk === "number";
-                            // ----------------------------------------------------------
+                            const order = orderMap.get(eid); // unique sequence number
+                            const sc = scoreMap.get(eid) ?? priorityScore(event);
+                            const showOrder = typeof order === "number";
+
+                            const isParent = parentIdsWithChildren.has(eid);
+                            const kids = isParent ? childrenByParent.get(eid) || [] : [];
+                            const progress = isParent ? parentProgress.get(eid) ?? 0 : 0;
+                            const k = kids.length;
 
                             return (
                               <li
@@ -1002,29 +1007,31 @@ export default function Schedule() {
                                   "p-4 rounded-xl shadow-sm border",
                                   "flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3",
                                   "transition hover:shadow-md",
-                                  showOverlapWarning ? "border-amber-300 bg-amber-50/40" : "border-gray-100 bg-white",
+                                  isDoubleBooked(event)
+                                    ? "border-amber-300 bg-amber-50/40"
+                                    : "border-gray-100 bg-white",
                                   event.status === "completed" ? "bg-green-50 border-green-200" : "",
                                   event.status === "missed" ? "bg-red-50 border-red-200" : "",
                                 ].join(" ")}
                               >
-                                <div className="flex-1">
+                                <div className="flex-1 w-full">
                                   <div className="flex items-center gap-2 flex-wrap">
-                                    {/* Priority rank bubble (only ongoing/upcoming) */}
-                                    {showRank && (
+                                    {showOrder && (
                                       <span
                                         className={`inline-flex items-center justify-center h-7 w-7 rounded-full text-white text-xs font-semibold ${scoreColor(
                                           sc
                                         )}`}
-                                        title={`Priority rank #${rk}`}
+                                        title={`Priority order #${order}`}
                                       >
-                                        {rk}
+                                        {order}
                                       </span>
                                     )}
 
-                                    <p className="font-semibold text-lg text-gray-800">{event.title}</p>
+                                    <p className="font-semibold text-lg text-gray-800">
+                                      {event.title}
+                                    </p>
 
-                                    {/* Score chip (only when ranked) */}
-                                    {showRank && (
+                                    {showOrder && (
                                       <span
                                         className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200"
                                         title="Priority score"
@@ -1033,7 +1040,6 @@ export default function Schedule() {
                                       </span>
                                     )}
 
-                                    {/* Badges */}
                                     <span
                                       className={`text-xs px-2 py-0.5 rounded-full border ${
                                         event.urgency === "high"
@@ -1050,7 +1056,9 @@ export default function Schedule() {
                                           : "border-gray-200 text-gray-600 bg-gray-50"
                                       }`}
                                     >
-                                      {event.importance === "high" ? "Important" : "Somewhat Important"}
+                                      {event.importance === "high"
+                                        ? "Important"
+                                        : "Somewhat Important"}
                                     </span>
 
                                     {isOngoing && (
@@ -1059,63 +1067,63 @@ export default function Schedule() {
                                       </span>
                                     )}
 
-                                    {showOverlapWarning && (
+                                    {isDoubleBooked(event) && (
                                       <span className="text-xs inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
                                         <FiAlertTriangle /> Possible overlap
                                       </span>
                                     )}
+
+                                    {isParent && (
+                                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                        Segmented · {k} parts
+                                      </span>
+                                    )}
                                   </div>
 
-                                  <p className="text-gray-600 text-sm mt-1">{formatRange(event)}</p>
+                                  <p className="text-gray-600 text-sm mt-1">
+                                    {formatRange(event)}
+                                  </p>
 
-                                  {event.isShared ? (
-                                    <p className="text-xs text-gray-500 mt-1">
-                                      Shared by {event.userName || "Someone"} — Status: <strong>{event.shareStatus}</strong>
-                                    </p>
-                                  ) : event.userId === user.id && event.sharedWith?.length > 0 ? (
-                                    <p className="text-xs text-gray-500 mt-1">
-                                      Shared with {event.sharedWith.length} people
-                                    </p>
-                                  ) : null}
-
-                                  {isIncomingPending && (
-                                    <div className="flex gap-2 mt-3">
-                                      <button
-                                        onClick={() => handleRecipientChoice(event.shareRequestId, "keep")}
-                                        className="inline-flex items-center gap-1 px-3 py-1 rounded bg-green-600 text-white hover:bg-green-700"
-                                      >
-                                        <FiCheckCircle /> Accept
-                                      </button>
-                                      <button
-                                        onClick={() => handleRecipientChoice(event.shareRequestId, "decline")}
-                                        className="inline-flex items-center gap-1 px-3 py-1 rounded bg-red-600 text-white hover:bg-red-700"
-                                      >
-                                        <FiXCircle /> Decline
-                                      </button>
-                                    </div>
+                                  {/* Segment progress for parent */}
+                                  {isParent && (
+                                    <>
+                                      <ProgressBar fraction={progress} />
+                                      <div className="text-xs text-slate-600 mt-1">
+                                        {Math.round(progress * k)} of {k} segments completed
+                                        {progress >= THRESHOLD_COMPLETE && !event.status && (
+                                          <span className="ml-2 text-emerald-700 font-medium">
+                                            (auto-marked complete at{" "}
+                                            {Math.round(THRESHOLD_COMPLETE * 100)}%)
+                                          </span>
+                                        )}
+                                      </div>
+                                      <SegmentChips childrenList={kids} />
+                                    </>
                                   )}
 
-                                  {dayjs().tz(TZ).isAfter(dayjs(event.end)) && !event.status && !event.isShared && (
-                                    <div className="flex gap-2 mt-3">
-                                      <button
-                                        onClick={() => markStatus(event._id, "completed")}
-                                        className="inline-flex items-center gap-1 px-3 py-1 rounded bg-green-600 text-white hover:bg-green-700"
-                                      >
-                                        <FiCheckCircle /> Mark Completed
-                                      </button>
-                                      <button
-                                        onClick={() => markStatus(event._id, "missed")}
-                                        className="inline-flex items-center gap-1 px-3 py-1 rounded bg-red-600 text-white hover:bg-red-700"
-                                      >
-                                        <FiXCircle /> Mark Missed
-                                      </button>
-                                    </div>
-                                  )}
+                                  {/* Manual mark only when past end and not already marked */}
+                                  {now.tz(TZ).isAfter(dayjs(event.end).tz(TZ)) &&
+                                    !event.status &&
+                                    !isParent && (
+                                      <div className="flex gap-2 mt-3">
+                                        <button
+                                          onClick={() => markStatus(event._id, "completed")}
+                                          className="inline-flex items-center gap-1 px-3 py-1 rounded bg-green-600 text-white hover:bg-green-700"
+                                        >
+                                          <FiCheckCircle /> Mark Completed
+                                        </button>
+                                        <button
+                                          onClick={() => markStatus(event._id, "missed")}
+                                          className="inline-flex items-center gap-1 px-3 py-1 rounded bg-red-600 text-white hover:bg-red-700"
+                                        >
+                                          <FiXCircle /> Mark Missed
+                                        </button>
+                                      </div>
+                                    )}
                                 </div>
 
                                 <div className="flex gap-2 flex-shrink-0">
-                                  {/* Hide edit/delete/split/share for incoming virtuals */}
-                                  {!event.status && !event.isShared && (
+                                  {!event.status && (
                                     <button
                                       onClick={() => openModal(event)}
                                       title="Edit"
@@ -1125,7 +1133,7 @@ export default function Schedule() {
                                       <span className="hidden sm:inline">Edit</span>
                                     </button>
                                   )}
-                                  {!event.status && !event.isShared && (
+                                  {!event.status && (
                                     <button
                                       onClick={() => handleDelete(event._id)}
                                       title="Delete"
@@ -1135,7 +1143,9 @@ export default function Schedule() {
                                       <span className="hidden sm:inline">Delete</span>
                                     </button>
                                   )}
-                                  {!event.status && !event.isShared && allowSegment && (
+
+                                  {/* Split button: show ONLY when canSegmentEvent returns true */}
+                                  {!event.status && canSegmentEvent(event) && (
                                     <button
                                       onClick={() => openSegment(event)}
                                       title="Split into segments"
@@ -1145,20 +1155,6 @@ export default function Schedule() {
                                       <span className="hidden sm:inline">Split</span>
                                     </button>
                                   )}
-                                  {!event.status &&
-                                    !event.isShared &&
-                                    event.userId === user.id &&
-                                    !event.isVirtual &&
-                                    !isSegmentChild && (
-                                      <button
-                                        onClick={() => handleOpenShare(event)}
-                                        title="Share"
-                                        className="inline-flex items-center gap-1 px-3 py-1 rounded bg-blue-600 text-white hover:bg-blue-700"
-                                      >
-                                        <FiShare2 />
-                                        <span className="hidden sm:inline">Share</span>
-                                      </button>
-                                    )}
                                 </div>
                               </li>
                             );
@@ -1186,25 +1182,12 @@ export default function Schedule() {
         startTimePastError={startTimePastError}
       />
 
-      <ConflictModal
-        isOpen={!!conflictEvent}
-        conflict={conflictEvent}
-        onClose={() => {
-          setConflictEvent(null);
-          refreshAll();
-        }}
+      <SegmentModal
+        isOpen={segmentOpen}
+        onClose={closeSegment}
+        event={segmentTarget}
+        onSplitSuccess={handleSplitSuccess}
       />
-
-      <ShareModal
-        isOpen={shareModalOpen}
-        onClose={() => setShareModalOpen(false)}
-        eventId={eventToShare?._id ? String(eventToShare._id).split("-")[0] : undefined}
-        senderId={user?.id}
-        onShared={handleSharedEvent}
-        senderEmail={senderEmail}
-      />
-
-      <SegmentModal isOpen={segmentOpen} onClose={closeSegment} event={segmentTarget} onSplitSuccess={handleSplitSuccess} />
 
       <CreateConflictModal
         isOpen={createConflict.open}
@@ -1214,11 +1197,11 @@ export default function Schedule() {
         onReplace={handleCreateReplace}
         onKeep={handleCreateKeep}
         onReschedule={handleCreateReschedule}
-        newEventTitle={createConflict.newEvent?.title}
-        newEventStart={createConflict.newEvent?.start}
-        newEventEnd={createConflict.newEvent?.end}
+        newEvent={createConflict.newEvent} // <-- pass full new event payload (important)
       />
 
+      {/* Toasts */}
+      <ToastStack toasts={toasts} onClose={remove} />
     </div>
   );
 }

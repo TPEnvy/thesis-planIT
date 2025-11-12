@@ -125,6 +125,9 @@ const Navbar = () => {
             <Link to="/schedule" className="hover:text-green-600 transition">
               Schedule
             </Link>
+            <Link to="/chatbot" className="hover:text-green-600 transition">
+              Chat
+            </Link>
 
             {/* Notification bell */}
             <div className="relative">
@@ -333,6 +336,13 @@ const Navbar = () => {
             onClick={() => setIsMenuOpen(false)}
           >
             Schedule
+          </Link>
+                    <Link
+            to="/chatbot"
+            className="block py-2 hover:text-green-200"
+            onClick={() => setIsMenuOpen(false)}
+          >
+            Chat
           </Link>
           <div className="border-t border-green-600 mt-2 pt-2">
             <Link

@@ -1,5 +1,6 @@
 // src/util/useReminder.js
 import { useRef, useEffect, useCallback } from "react";
+import { toast } from "react-hot-toast";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import timezone from "dayjs/plugin/timezone";
@@ -9,13 +10,11 @@ dayjs.extend(timezone);
 
 const TZ = "Asia/Manila";
 const NAV_EVENT = "planit:notify";
-const BUFFER_WINDOW_MS = 1200; // group notifications that fire together
+const BUFFER_WINDOW_MS = 1200;
 
-// --- helpers (no hooks) ---
 function isValidDayjs(dj) {
   return dj && typeof dj.isValid === "function" && dj.isValid();
 }
-// normalize ids: strips -YYYY and virt_ prefix to line up with Schedule.jsx's baseId()
 function normId(v = "") {
   let s = String(v || "");
   if (s.startsWith("virt_")) s = s.slice(5);
@@ -24,65 +23,53 @@ function normId(v = "") {
 }
 
 export default function useReminders() {
-  // eventId -> [timeoutIds]
   const scheduledTimeoutsRef = useRef({});
-  // eventId -> { fiveBefore?: true, start?: true, end?: true }
   const notifiedRef = useRef({});
 
-  // buffer for batching UI notifications
-  const bufferRef = useRef([]); // array of { event, message }
+  const bufferRef = useRef([]);
   const bufferTimerRef = useRef(null);
 
   const ensurePermission = useCallback(async () => {
-    if (typeof window === "undefined" || !("Notification" in window)) return false;
-    if (Notification.permission === "granted") return true;
-    if (Notification.permission === "denied") return false;
-    try {
-      const perm = await Notification.requestPermission();
-      return perm === "granted";
-    } catch {
+    if (!("Notification" in window)) {
+      toast.error("Notifications not supported 🚫");
       return false;
     }
+    if (Notification.permission === "granted") return true;
+    if (Notification.permission === "denied") {
+      toast.error("Notifications blocked in browser settings");
+      return false;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm === "granted") toast.success("Notifications Enabled 🔔");
+    return perm === "granted";
   }, []);
 
   const dispatchNavEvent = useCallback((detail) => {
     try {
-      // DEBUG
-      // console.log("[useReminder] dispatch", NAV_EVENT, detail);
       window.dispatchEvent(new CustomEvent(NAV_EVENT, { detail }));
     } catch {
-      /* ignore */
+      // console.error("dispatchNavEvent failed"); // optional
     }
   }, []);
 
+
   const flushBuffer = useCallback(() => {
-    const items = bufferRef.current.splice(0, bufferRef.current.length);
+    const items = bufferRef.current.splice(0);
     bufferTimerRef.current = null;
     if (!items.length) return;
 
     if (items.length === 1) {
       const { event, message } = items[0];
 
-      // fallback alert (eslint no-alert? disable if needed)
-      try {
-        alert(`${event.title}: ${message}`);
-      } catch {
-        /* ignore */
+      toast(message, { icon: "⏰" });
+
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("⏰ Schedule Reminder", {
+          body: `${event.title}: ${message}`,
+          icon: "/favicon.ico",
+        });
       }
 
-      // Web Notification
-      if (typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
-        try {
-          new Notification("⏰ Schedule Reminder", {
-            body: `${event.title}: ${message}`,
-            icon: "/favicon.ico",
-          });
-        } catch {
-          /* ignore */
-        }
-      }
-
-      // Navbar bell
       dispatchNavEvent({
         title: "Schedule Reminder",
         message: `${event.title}: ${message}`,
@@ -91,22 +78,16 @@ export default function useReminders() {
       return;
     }
 
-    // combined
     const titles = items.map((i) => i.event.title).join(", ");
     const body = `${items.length} events: ${titles}`;
 
-    try {
-      alert(`⏰ Reminders\n${body}`);
-    } catch {
-      /* ignore */
-    }
+    toast(`🔔 ${body}`);
 
-    if (typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
-      try {
-        new Notification("⏰ Multiple reminders", { body, icon: "/favicon.ico" });
-      } catch {
-        /* ignore */
-      }
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification("⏰ Multiple reminders", {
+        body,
+        icon: "/favicon.ico",
+      });
     }
 
     dispatchNavEvent({
@@ -128,14 +109,13 @@ export default function useReminders() {
 
   const triggerReminder = useCallback(
     (event, message, key) => {
-      if (!event || !event._id) return;
       const id = normId(event._id);
+      if (notifiedRef.current[id]?.[key]) return;
 
-      if (notifiedRef.current[id]?.[key]) return; // de-dupe per event/key
-      notifiedRef.current[id] = { ...(notifiedRef.current[id] || {}), [key]: true };
-
-      // DEBUG
-      // console.log("[useReminder] trigger", { id, key, message });
+      notifiedRef.current[id] = {
+        ...(notifiedRef.current[id] || {}),
+        [key]: true,
+      };
 
       queueNotification(event, message);
     },
@@ -144,52 +124,45 @@ export default function useReminders() {
 
   const scheduleReminders = useCallback(
     (event) => {
-      if (!event || !event._id) return;
-      if (event.isVirtual) return;
+      if (!event?._id) return;
       if (event.status === "completed" || event.status === "missed") return;
 
       const id = normId(event._id);
-      if (scheduledTimeoutsRef.current[id]) return; // already scheduled
+      if (scheduledTimeoutsRef.current[id]) return;
 
       const now = dayjs().tz(TZ);
       const start = dayjs(event.start).tz(TZ);
       const end = dayjs(event.end).tz(TZ);
 
-      if (!isValidDayjs(start) || !isValidDayjs(end) || !end.isAfter(start)) {
-        // console.warn("[useReminder] skipped invalid event times", { event });
-        return;
-      }
-      if (end.isBefore(now)) {
-        // already finished in the past
-        return;
-      }
+      if (!isValidDayjs(start) || !isValidDayjs(end) || !end.isAfter(start)) return;
+      if (end.isBefore(now)) return;
 
       scheduledTimeoutsRef.current[id] = [];
 
-      // 5 minutes before start
       const fiveBefore = start.subtract(5, "minute");
       if (fiveBefore.isAfter(now)) {
-        const t = setTimeout(() => {
-          triggerReminder(event, "Upcoming event in 5 minutes!", "fiveBefore");
-        }, Math.max(0, fiveBefore.diff(now)));
-        scheduledTimeoutsRef.current[id].push(t);
+        scheduledTimeoutsRef.current[id].push(
+          setTimeout(() => {
+            triggerReminder(event, "Upcoming event in 5 minutes!", "fiveBefore");
+          }, fiveBefore.diff(now))
+        );
       }
 
-      // start
       if (start.isAfter(now)) {
-        const tStart = setTimeout(() => {
-          triggerReminder(event, "Event has started!", "start");
-        }, Math.max(0, start.diff(now)));
-        scheduledTimeoutsRef.current[id].push(tStart);
+        scheduledTimeoutsRef.current[id].push(
+          setTimeout(() => {
+            triggerReminder(event, "Event has started!", "start");
+          }, start.diff(now))
+        );
       }
 
-      // end (+1 min)
       const endNotifyTime = end.add(1, "minute");
       if (endNotifyTime.isAfter(now)) {
-        const tEnd = setTimeout(() => {
-          triggerReminder(event, "Event ended. Mark it ✔ Completed or ✖ Missed.", "end");
-        }, Math.max(0, endNotifyTime.diff(now)));
-        scheduledTimeoutsRef.current[id].push(tEnd);
+        scheduledTimeoutsRef.current[id].push(
+          setTimeout(() => {
+            triggerReminder(event, "Event ended. Mark ✔ or ✖", "end");
+          }, endNotifyTime.diff(now))
+        );
       }
     },
     [triggerReminder]
@@ -197,50 +170,25 @@ export default function useReminders() {
 
   const cancelRemindersFor = useCallback((eventId) => {
     const id = normId(eventId);
-    const arr = scheduledTimeoutsRef.current[id];
-    if (Array.isArray(arr)) {
-      arr.forEach((t) => {
-        try {
-          clearTimeout(t);
-        } catch {
-          /* ignore */
-        }
-      });
-    }
+    const timers = scheduledTimeoutsRef.current[id];
+    timers?.forEach(clearTimeout);
     delete scheduledTimeoutsRef.current[id];
     delete notifiedRef.current[id];
   }, []);
 
   const cancelAllReminders = useCallback(() => {
-    Object.values(scheduledTimeoutsRef.current).forEach((arr) => {
-      if (Array.isArray(arr)) {
-        arr.forEach((t) => {
-          try {
-            clearTimeout(t);
-          } catch {
-            /* ignore */
-          }
-        });
-      }
-    });
+    Object.values(scheduledTimeoutsRef.current).forEach((arr) =>
+      arr?.forEach(clearTimeout)
+    );
     scheduledTimeoutsRef.current = {};
     notifiedRef.current = {};
 
-    if (bufferTimerRef.current) {
-      try {
-        clearTimeout(bufferTimerRef.current);
-      } catch {
-        /* ignore */
-      }
-      bufferTimerRef.current = null;
-    }
+    if (bufferTimerRef.current) clearTimeout(bufferTimerRef.current);
+    bufferTimerRef.current = null;
     bufferRef.current = [];
   }, []);
 
-  // cleanup on unmount
-  useEffect(() => {
-    return () => cancelAllReminders();
-  }, [cancelAllReminders]);
+  useEffect(() => cancelAllReminders, [cancelAllReminders]);
 
   return { scheduleReminders, cancelRemindersFor, cancelAllReminders, ensurePermission };
 }

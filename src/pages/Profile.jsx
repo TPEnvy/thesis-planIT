@@ -1,488 +1,400 @@
 // src/pages/Profile.jsx
-import { useEffect, useState, useMemo, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000";
-const DEFAULT_TZ = "Asia/Manila";
-const TZ_CHOICES = [
-  { id: "auto", label: "Auto-detect (browser timezone)" },
-  { id: "Asia/Manila", label: "Asia/Manila" },
-  { id: "UTC", label: "UTC" },
-  { id: "America/New_York", label: "America/New_York" },
-  { id: "Europe/London", label: "Europe/London" },
-  { id: "Asia/Tokyo", label: "Asia/Tokyo" },
-];
+const API_URL = "http://localhost:5000";
 
-function notify(title, message, href) {
-  window.dispatchEvent(
-    new CustomEvent("planit:notify", { detail: { title, message, href } })
+function Toast({ kind = "info", message = "", onClose }) {
+  if (!message) return null;
+  const styles =
+    kind === "success"
+      ? "bg-emerald-600"
+      : kind === "error"
+      ? "bg-rose-600"
+      : "bg-slate-700";
+  return (
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
+      <div className={`text-white px-4 py-2 rounded-lg shadow-lg ${styles}`}>
+        <div className="flex items-center gap-3">
+          <span className="text-sm">{message}</span>
+          <button
+            onClick={onClose}
+            className="text-white/80 hover:text-white text-xs underline"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
 export default function Profile() {
-  const navigate = useNavigate();
-
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [pwdSaving, setPwdSaving] = useState(false);
-  const [errMsg, setErrMsg] = useState("");
-  const [msg, setMsg] = useState("");
-
-  // Profile form
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
-  const [timezone, setTimezone] = useState(DEFAULT_TZ);
-  const [theme, setTheme] = useState("system"); // "light" | "dark" | "system"
-  const [notifyEnabled, setNotifyEnabled] = useState(true);
-
-  // Password form
-  const [currentPwd, setCurrentPwd] = useState("");
-  const [newPwd, setNewPwd] = useState("");
-  const [confirmPwd, setConfirmPwd] = useState("");
-
-  // Avatar
-  const [avatarPreview, setAvatarPreview] = useState(null);
-  const avatarFileRef = useRef(null);
-
-  const authHeaders = useMemo(() => {
-    const token = localStorage.getItem("token");
-    const headers = { "Content-Type": "application/json" };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-    return headers;
-  }, []);
-
-  const logoutAndRedirect = () => {
-    localStorage.removeItem("user");
-    localStorage.removeItem("token");
-    navigate("/login", { replace: true });
-  };
-
-  useEffect(() => {
-    // Require auth
-    const raw = localStorage.getItem("user");
-    if (!raw) return logoutAndRedirect();
-    let u;
+  const [authUser, setAuthUser] = useState(() => {
     try {
-      u = JSON.parse(raw);
-      if (!u?.id) throw new Error();
+      const raw = localStorage.getItem("user");
+      return raw ? JSON.parse(raw) : null;
     } catch {
-      return logoutAndRedirect();
+      return null;
     }
-    setUser(u);
+  });
 
-    const controller = new AbortController();
-    (async () => {
-      setLoading(true);
-      setErrMsg("");
-      setMsg("");
+  const userId = authUser?.id || "";
+
+  // Profile form state
+  const [fullname, setFullname] = useState("");
+  const [email, setEmail] = useState("");
+
+  // Password form state
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNew, setConfirmNew] = useState("");
+
+  // UI state
+  const [loadingProfile, setLoadingProfile] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [savingPassword, setSavingPassword] = useState(false);
+
+  // Toast
+  const [toast, setToast] = useState({ kind: "info", message: "" });
+  const showToast = (kind, message) => {
+    setToast({ kind, message });
+    // Auto-hide after 3.5s
+    window.clearTimeout((showToast._tid || 0));
+    showToast._tid = window.setTimeout(() => setToast({ kind: "info", message: "" }), 3500);
+  };
+
+  // Derived validations
+  const emailValid = useMemo(() => {
+    if (!email) return false;
+    // simple email check
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  }, [email]);
+
+  const nameValid = useMemo(() => (fullname || "").trim().length >= 2, [fullname]);
+
+  const passwordMatch = useMemo(() => newPassword === confirmNew, [newPassword, confirmNew]);
+  const passwordStrong = useMemo(() => (newPassword || "").length >= 8, [newPassword]);
+
+  // Load profile
+  useEffect(() => {
+    const load = async () => {
+      if (!userId) return;
+      setLoadingProfile(true);
       try {
-        const res = await fetch(`${API_BASE}/users/${u.id}`, {
-          method: "GET",
-          headers: authHeaders,
-          credentials: "include",
-          signal: controller.signal,
-        });
-        if (res.status === 401 || res.status === 403) return logoutAndRedirect();
-
-        const data = res.ok ? await res.json().catch(() => ({})) : {};
-        // Fallback to local user fields if API lacks them
-        setName(data.name ?? u.name ?? "");
-        setEmail(data.email ?? u.email ?? "");
-        const tzFromApi = data.timezone ?? u.timezone ?? DEFAULT_TZ;
-        setTimezone(tzFromApi);
-        setTheme(data?.preferences?.theme ?? "system");
-        setNotifyEnabled(
-          (data?.preferences?.notifications ?? true) === true
-        );
-        if (data?.avatarUrl) setAvatarPreview(data.avatarUrl);
-      } catch (e) {
-        console.error(e);
-        setErrMsg("Failed to load profile.");
+        const res = await fetch(`${API_URL}/users/${userId}`);
+        if (!res.ok) {
+          if (res.status === 404) {
+            showToast("error", "User not found.");
+          } else {
+            showToast("error", "Failed to fetch profile.");
+          }
+          return;
+        }
+        const data = await res.json();
+        setFullname(data?.fullname || authUser?.fullname || "");
+        setEmail(data?.email || authUser?.email || "");
+      } catch {
+        showToast("error", "Network error while loading profile.");
       } finally {
-        setLoading(false);
+        setLoadingProfile(false);
       }
-    })();
-    return () => controller.abort();
+    };
+    load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [userId]);
 
-  const handleSaveProfile = async (e) => {
+  // Save profile (fullname + email)
+  const onSaveProfile = async (e) => {
     e.preventDefault();
-    if (!user) return;
+    if (!userId) {
+      showToast("error", "You are not logged in.");
+      return;
+    }
+    if (!nameValid || !emailValid) {
+      showToast("error", "Please enter a valid name and email.");
+      return;
+    }
 
-    setSaving(true);
-    setErrMsg("");
-    setMsg("");
-
-    // Resolve timezone if "auto"
-    const tz =
-      timezone === "auto"
-        ? Intl.DateTimeFormat().resolvedOptions().timeZone || DEFAULT_TZ
-        : timezone;
-
+    setSavingProfile(true);
     try {
-      const res = await fetch(`${API_BASE}/users/${user.id}`, {
+      const res = await fetch(`${API_URL}/users/${userId}`, {
         method: "PUT",
-        headers: authHeaders,
-        credentials: "include",
-        body: JSON.stringify({
-          name,
-          email,
-          timezone: tz,
-          preferences: {
-            theme,
-            notifications: notifyEnabled,
-          },
-        }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fullname: fullname.trim(), email: email.trim() }),
       });
-      let data = {};
-      try {
-        data = await res.json();
-      } catch {
-         console.log();
-      }
 
       if (!res.ok) {
-        setErrMsg(data?.error || "Unable to save profile.");
+        if (res.status === 404) {
+          showToast("error", "Updating profile is not available on the server.");
+        } else if (res.status === 409) {
+          showToast("error", "Email already in use.");
+        } else {
+          const msg = (await res.json().catch(() => ({})))?.error || "Failed to update profile.";
+          showToast("error", msg);
+        }
         return;
       }
 
-      // Sync localStorage copy
-      const newLocal = { ...(JSON.parse(localStorage.getItem("user")) || {}), name, email, timezone: tz };
-      localStorage.setItem("user", JSON.stringify(newLocal));
+      const updated = await res.json();
+      // Keep localStorage in sync for Navbar, etc.
+      const merged = {
+        ...authUser,
+        fullname: updated?.fullname || fullname.trim(),
+        email: updated?.email || email.trim(),
+      };
+      setAuthUser(merged);
+      localStorage.setItem("user", JSON.stringify(merged));
 
-      setMsg("✅ Profile updated");
-      notify("Profile saved", "Your profile changes have been applied.", "/profile");
-    } catch (e) {
-      console.error(e);
-      setErrMsg("Network error while saving profile.");
+      showToast("success", "Profile updated successfully.");
+    } catch {
+      showToast("error", "Network error while saving profile.");
     } finally {
-      setSaving(false);
+      setSavingProfile(false);
     }
   };
 
-  const handleChangePassword = async (e) => {
+  // Change password
+  const onChangePassword = async (e) => {
     e.preventDefault();
-    if (!user) return;
-
-    if (!currentPwd || !newPwd || !confirmPwd) {
-      setErrMsg("⚠️ Fill out all password fields.");
+    if (!userId) {
+      showToast("error", "You are not logged in.");
       return;
     }
-    if (newPwd !== confirmPwd) {
-      setErrMsg("⚠️ New passwords do not match.");
-      return;
-    }
-    if (newPwd.length < 8) {
-      setErrMsg("⚠️ Use at least 8 characters for the new password.");
+    if (!currentPassword || !passwordStrong || !passwordMatch) {
+      showToast(
+        "error",
+        !currentPassword
+          ? "Please enter your current password."
+          : !passwordStrong
+          ? "New password must be at least 8 characters."
+          : "New passwords do not match."
+      );
       return;
     }
 
-    setPwdSaving(true);
-    setErrMsg("");
-    setMsg("");
-
+    setSavingPassword(true);
     try {
-      const res = await fetch(`${API_BASE}/users/${user.id}/password`, {
-        method: "POST",
-        headers: authHeaders,
-        credentials: "include",
-        body: JSON.stringify({ currentPassword: currentPwd, newPassword: newPwd }),
+      const res = await fetch(`${API_URL}/users/${userId}/password`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword, newPassword }),
       });
-      let data = {};
-      try {
-        data = await res.json();
-      } catch {
-        console.log();
-      }
 
       if (!res.ok) {
-        setErrMsg(data?.error || "Unable to change password.");
+        if (res.status === 404) {
+          showToast("error", "Password change is not available on the server.");
+        } else if (res.status === 400) {
+          const body = await res.json().catch(() => ({}));
+          showToast("error", body?.error || "Invalid request. Check your inputs.");
+        } else if (res.status === 401) {
+          showToast("error", "Current password is incorrect.");
+        } else {
+          const body = await res.json().catch(() => ({}));
+          showToast("error", body?.error || "Failed to change password.");
+        }
         return;
       }
 
-      setMsg("✅ Password updated");
-      setCurrentPwd("");
-      setNewPwd("");
-      setConfirmPwd("");
-      notify("Password changed", "Your password was updated successfully.");
-    } catch (e) {
-      console.error(e);
-      setErrMsg("Network error while changing password.");
+      // Success
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmNew("");
+      showToast("success", "Password changed successfully.");
+    } catch {
+      showToast("error", "Network error while changing password.");
     } finally {
-      setPwdSaving(false);
+      setSavingPassword(false);
     }
   };
 
-  const handleAvatarPick = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setErrMsg("");
-    setMsg("");
-
-    // Preview
-    const url = URL.createObjectURL(file);
-    setAvatarPreview(url);
-
-    // Optional upload if your backend supports it
-    try {
-      const form = new FormData();
-      form.append("avatar", file);
-      const token = localStorage.getItem("token");
-      const headers = token ? { Authorization: `Bearer ${token}` } : {};
-      const res = await fetch(`${API_BASE}/users/${user.id}/avatar`, {
-        method: "POST",
-        headers,
-        credentials: "include",
-        body: form,
-      });
-      if (!res.ok) {
-        setErrMsg("Failed to upload avatar.");
-      } else {
-        setMsg("✅ Avatar updated");
-        notify("Avatar updated", "Your profile photo has been changed.", "/profile");
-      }
-    } catch (e) {
-      console.error(e);
-      setErrMsg("Network error while uploading avatar.");
-    }
-  };
-
-  const handleLogoutEverywhere = async () => {
-    try {
-      await fetch(`${API_BASE}/logout`, { method: "POST", credentials: "include" }).catch(() => {});
-    } finally {
-      localStorage.removeItem("user");
-      localStorage.removeItem("token");
-      navigate("/login", { replace: true });
-    }
-  };
+  if (!authUser) {
+    return (
+      <div className="flex flex-col min-h-screen bg-gradient-to-br from-green-200 to-green-50">
+        <Navbar />
+        <main className="flex-grow flex items-center justify-center p-6">
+          <div className="bg-white rounded-2xl shadow-xl p-8 text-center max-w-md w-full">
+            <h1 className="text-2xl font-bold text-gray-800">You’re signed out</h1>
+            <p className="text-gray-600 mt-2">Please sign in to view your profile.</p>
+            <a
+              href="/login"
+              className="inline-block mt-4 bg-green-700 text-white px-5 py-2 rounded-lg hover:bg-green-800"
+            >
+              Go to Login
+            </a>
+          </div>
+        </main>
+        <Footer />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col min-h-screen bg-gradient-to-br from-green-200 to-green-50">
       <Navbar />
       <main className="flex-grow p-4 sm:p-6">
-        <div className="mx-auto max-w-5xl">
-          <h1 className="text-2xl sm:text-3xl font-extrabold text-green-900 mb-4">Profile</h1>
-
-          {/* Messages */}
-          {errMsg && (
-            <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-red-800" role="alert" aria-live="polite">
-              {errMsg}
+        <div className="mx-auto max-w-4xl space-y-6">
+          {/* Header Card */}
+          <div className="bg-white rounded-2xl shadow-xl p-6">
+            <div className="flex items-center gap-4">
+              <div className="h-14 w-14 rounded-full bg-green-100 flex items-center justify-center text-green-800 font-bold">
+                {fullname?.[0]?.toUpperCase() || authUser.fullname?.[0]?.toUpperCase() || "U"}
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold text-green-900">Account</h1>
+                <p className="text-sm text-gray-600">
+                  Manage your profile and password
+                </p>
+              </div>
             </div>
-          )}
-          {msg && (
-            <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-green-800" role="status" aria-live="polite">
-              {msg}
-            </div>
-          )}
+          </div>
 
-          {/* Skeleton */}
-          {loading ? (
-            <div className="grid gap-6 sm:grid-cols-2">
-              <div className="h-64 rounded-2xl bg-white shadow animate-pulse" />
-              <div className="h-64 rounded-2xl bg-white shadow animate-pulse" />
-            </div>
-          ) : (
-            <div className="grid gap-6 sm:grid-cols-2">
-              {/* Profile info card */}
-              <section className="bg-white shadow-xl rounded-2xl p-6">
-                <h2 className="text-lg font-semibold text-green-900 mb-4">Account</h2>
+          {/* Profile Form */}
+          <section className="bg-white rounded-2xl shadow-xl p-6">
+            <h2 className="text-lg font-semibold text-gray-900">Profile</h2>
+            <p className="text-sm text-gray-600 mb-4">Update your name and email.</p>
 
-                {/* Avatar */}
-                <div className="flex items-center gap-4 mb-4">
-                  <div className="w-16 h-16 rounded-full bg-green-100 overflow-hidden flex items-center justify-center">
-                    {avatarPreview ? (
-                      <img src={avatarPreview} alt="Avatar preview" className="w-full h-full object-cover" />
-                    ) : (
-                      <span className="text-green-700 text-sm">No Avatar</span>
-                    )}
-                  </div>
-                  <div>
-                    <button
-                      type="button"
-                      onClick={() => avatarFileRef.current?.click()}
-                      className="px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-sm font-medium"
-                    >
-                      Upload avatar
-                    </button>
-                    <input
-                      ref={avatarFileRef}
-                      type="file"
-                      accept="image/*"
-                      onChange={handleAvatarPick}
-                      className="hidden"
-                    />
-                  </div>
+            <form onSubmit={onSaveProfile} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Full name</label>
+                <input
+                  type="text"
+                  value={fullname}
+                  onChange={(e) => setFullname(e.target.value)}
+                  className="mt-1 w-full rounded-lg border px-3 py-2 focus:ring-2 focus:ring-green-600 outline-none"
+                  placeholder="Your full name"
+                  autoComplete="name"
+                />
+                {!nameValid && (
+                  <p className="text-xs text-rose-600 mt-1">
+                    Name must be at least 2 characters.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Email</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="mt-1 w-full rounded-lg border px-3 py-2 focus:ring-2 focus:ring-green-600 outline-none"
+                  placeholder="you@example.com"
+                  autoComplete="email"
+                />
+                {!emailValid && email && (
+                  <p className="text-xs text-rose-600 mt-1">Enter a valid email.</p>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 pt-2">
+                <button
+                  type="submit"
+                  disabled={savingProfile || !nameValid || !emailValid}
+                  className={`px-4 py-2 rounded-lg text-white font-medium ${
+                    savingProfile || !nameValid || !emailValid
+                      ? "bg-gray-400 cursor-not-allowed"
+                      : "bg-green-700 hover:bg-green-800"
+                  }`}
+                >
+                  {savingProfile ? "Saving…" : "Save changes"}
+                </button>
+                {loadingProfile && (
+                  <span className="text-sm text-gray-500">Loading profile…</span>
+                )}
+              </div>
+            </form>
+          </section>
+
+          {/* Password Form */}
+          <section className="bg-white rounded-2xl shadow-xl p-6">
+            <h2 className="text-lg font-semibold text-gray-900">Change password</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Use at least 8 characters for a strong password.
+            </p>
+
+            <form onSubmit={onChangePassword} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Current password</label>
+                <input
+                  type="password"
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  className="mt-1 w-full rounded-lg border px-3 py-2 focus:ring-2 focus:ring-green-600 outline-none"
+                  autoComplete="current-password"
+                  placeholder="••••••••"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">New password</label>
+                  <input
+                    type="password"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="mt-1 w-full rounded-lg border px-3 py-2 focus:ring-2 focus:ring-green-600 outline-none"
+                    autoComplete="new-password"
+                    placeholder="At least 8 characters"
+                  />
+                  {!passwordStrong && newPassword && (
+                    <p className="text-xs text-rose-600 mt-1">
+                      New password must be at least 8 characters.
+                    </p>
+                  )}
                 </div>
-
-                <form onSubmit={handleSaveProfile} className="space-y-4">
-                  <div>
-                    <label htmlFor="name" className="block text-sm font-medium text-green-900 mb-1">
-                      Full name
-                    </label>
-                    <input
-                      id="name"
-                      type="text"
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="email" className="block text-sm font-medium text-green-900 mb-1">
-                      Email
-                    </label>
-                    <input
-                      id="email"
-                      type="email"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800"
-                      required
-                    />
-                  </div>
-
-                  <div className="grid sm:grid-cols-2 gap-3">
-                    <div>
-                      <label htmlFor="timezone" className="block text-sm font-medium text-green-900 mb-1">
-                        Timezone
-                      </label>
-                      <select
-                        id="timezone"
-                        value={timezone}
-                        onChange={(e) => setTimezone(e.target.value)}
-                        className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800 bg-white"
-                      >
-                        {TZ_CHOICES.map((tz) => (
-                          <option key={tz.id} value={tz.id}>
-                            {tz.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <label htmlFor="theme" className="block text-sm font-medium text-green-900 mb-1">
-                        Theme
-                      </label>
-                      <select
-                        id="theme"
-                        value={theme}
-                        onChange={(e) => setTheme(e.target.value)}
-                        className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800 bg-white"
-                      >
-                        <option value="system">System</option>
-                        <option value="light">Light</option>
-                        <option value="dark">Dark</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <label className="inline-flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={notifyEnabled}
-                      onChange={(e) => setNotifyEnabled(e.target.checked)}
-                      className="h-4 w-4 rounded border-green-300 text-green-700 focus:ring-green-700"
-                    />
-                    <span className="text-sm text-gray-700">
-                      Enable in-app notifications
-                    </span>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">
+                    Confirm new password
                   </label>
-
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="w-full bg-green-800 text-white py-2.5 rounded-xl font-semibold hover:bg-green-900 disabled:opacity-60"
-                  >
-                    {saving ? "Saving..." : "Save changes"}
-                  </button>
-                </form>
-              </section>
-
-              {/* Password card */}
-              <section className="bg-white shadow-xl rounded-2xl p-6">
-                <h2 className="text-lg font-semibold text-green-900 mb-4">Change Password</h2>
-
-                <form onSubmit={handleChangePassword} className="space-y-4">
-                  <div>
-                    <label htmlFor="currentPwd" className="block text-sm font-medium text-green-900 mb-1">
-                      Current password
-                    </label>
-                    <input
-                      id="currentPwd"
-                      type="password"
-                      value={currentPwd}
-                      onChange={(e) => setCurrentPwd(e.target.value)}
-                      className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800"
-                      autoComplete="current-password"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="newPwd" className="block text-sm font-medium text-green-900 mb-1">
-                      New password
-                    </label>
-                    <input
-                      id="newPwd"
-                      type="password"
-                      value={newPwd}
-                      onChange={(e) => setNewPwd(e.target.value)}
-                      className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800"
-                      autoComplete="new-password"
-                      minLength={8}
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="confirmPwd" className="block text-sm font-medium text-green-900 mb-1">
-                      Confirm new password
-                    </label>
-                    <input
-                      id="confirmPwd"
-                      type="password"
-                      value={confirmPwd}
-                      onChange={(e) => setConfirmPwd(e.target.value)}
-                      className="w-full p-3 border border-green-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-green-800"
-                      autoComplete="new-password"
-                      minLength={8}
-                      required
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={pwdSaving}
-                    className="w-full bg-green-800 text-white py-2.5 rounded-xl font-semibold hover:bg-green-900 disabled:opacity-60"
-                  >
-                    {pwdSaving ? "Updating..." : "Update password"}
-                  </button>
-                </form>
-
-                {/* Danger zone */}
-                <div className="mt-6 border-t pt-4">
-                  <h3 className="text-sm font-semibold text-red-700 mb-2">Danger zone</h3>
-                  <button
-                    onClick={handleLogoutEverywhere}
-                    className="w-full bg-red-600 text-white py-2.5 rounded-xl font-semibold hover:bg-red-700"
-                  >
-                    Log out everywhere
-                  </button>
+                  <input
+                    type="password"
+                    value={confirmNew}
+                    onChange={(e) => setConfirmNew(e.target.value)}
+                    className="mt-1 w-full rounded-lg border px-3 py-2 focus:ring-2 focus:ring-green-600 outline-none"
+                    autoComplete="new-password"
+                    placeholder="Repeat new password"
+                  />
+                  {!passwordMatch && confirmNew && (
+                    <p className="text-xs text-rose-600 mt-1">Passwords do not match.</p>
+                  )}
                 </div>
-              </section>
-            </div>
-          )}
+              </div>
+
+              <div className="flex items-center gap-2 pt-2">
+                <button
+                  type="submit"
+                  disabled={
+                    savingPassword ||
+                    !currentPassword ||
+                    !passwordStrong ||
+                    !passwordMatch
+                  }
+                  className={`px-4 py-2 rounded-lg text-white font-medium ${
+                    savingPassword ||
+                    !currentPassword ||
+                    !passwordStrong ||
+                    !passwordMatch
+                      ? "bg-gray-400 cursor-not-allowed"
+                      : "bg-green-700 hover:bg-green-800"
+                  }`}
+                >
+                  {savingPassword ? "Updating…" : "Change password"}
+                </button>
+              </div>
+            </form>
+          </section>
         </div>
       </main>
+
       <Footer />
+
+      <Toast
+        kind={toast.kind}
+        message={toast.message}
+        onClose={() => setToast({ kind: "info", message: "" })}
+      />
     </div>
   );
 }

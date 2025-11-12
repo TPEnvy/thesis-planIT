@@ -1,17 +1,17 @@
 // src/components/CreateConflictModal.jsx
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import dayjs from "dayjs";
 
 /**
  * Props:
  * - isOpen
  * - onClose
- * - conflicts: Array<{ _id, title, start, end }>
- * - suggestions: optional array of { start, end } slots  (if provided, these will be shown instead)
+ * - conflicts: Array<{ _id, title, start, end, importance, urgency, difficulty }>
+ * - suggestions: optional array of { start, end }
  * - onReplace: () => void
  * - onKeep: () => void
- * - onReschedule: (slot) => void
- * - newEventTitle: optional string; if provided, we'll warn if titles match
+ * - onReschedule: (slot: {start: Date, end: Date}) => void
+ * - newEvent: { title, start, end, importance, urgency, difficulty }
  */
 export default function CreateConflictModal({
   isOpen,
@@ -21,44 +21,52 @@ export default function CreateConflictModal({
   onReplace,
   onKeep,
   onReschedule,
-  newEventTitle, // optional
+  newEvent = null,
 }) {
+  const [confirmKeep, setConfirmKeep] = useState(false);
   const [availableSlots, setAvailableSlots] = useState([]);
-  const [confirmKeep, setConfirmKeep] = useState(false); // step-2 confirmation
 
-  const DEFAULT_DURATION_MIN = 60; // default event duration for suggestions
-
-  // normalize helper (for title comparison)
-  const norm = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
-
-  // detect "same task" if newEventTitle provided
-  const maybeSameTask =
-    !!newEventTitle &&
-    conflicts.some((c) => norm(c.title) && norm(c.title) === norm(newEventTitle));
-
-  const formatSlotRange = (slot) => {
-    const s = dayjs(slot.start);
-    const e = dayjs(slot.end);
-    const sameDay = s.isSame(e, "day");
-    return sameDay
-      ? `${s.format("MMM D, h:mm A")} – ${e.format("h:mm A")}`
-      : `${s.format("MMM D, h:mm A")} – ${e.format("MMM D, h:mm A")}`;
+  // --- helpers ---
+  const toMs = (v) => {
+    try {
+      const t = new Date(v).getTime();
+      return Number.isFinite(t) ? t : NaN;
+    } catch {
+      return NaN;
+    }
   };
 
-  // Build 3 friendly suggestions based on the latest conflict end (or now)
-  const buildUpcomingSuggestions = useCallback(() => {
-    if (!conflicts.length) return [];
+  // Duration of the candidate new event, fallback 60 minutes
+  const newEventDurationMin = useMemo(() => {
+    if (!newEvent) return 60;
+    const s = toMs(newEvent.start);
+    const e = toMs(newEvent.end);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return 60;
+    return Math.max(1, Math.round((e - s) / 60000));
+  }, [newEvent]);
 
-    // Get the latest end among conflicts
-    let latestEnd = dayjs(conflicts[0].end);
-    for (let i = 1; i < conflicts.length; i++) {
-      const e = dayjs(conflicts[i].end);
-      if (e.isAfter(latestEnd)) latestEnd = e;
-    }
+  // ✅ EXACT match (same start & same end, ignore attributes)
+  const exactConflicts = useMemo(() => {
+    if (!newEvent || !Array.isArray(conflicts) || conflicts.length === 0) return [];
+    const ns = toMs(newEvent.start);
+    const ne = toMs(newEvent.end);
+    if (!Number.isFinite(ns) || !Number.isFinite(ne)) return [];
+    return conflicts.filter((c) => toMs(c.start) === ns && toMs(c.end) === ne);
+  }, [conflicts, newEvent]);
+
+  // Build suggestions only when exact conflicts exist.
+  const buildSuggestions = useCallback(() => {
+    if (!newEvent || exactConflicts.length === 0) return [];
+
+    // Use the latest conflicting end (or now) as base
+    const latestEnd = exactConflicts.reduce((acc, c) => {
+      const ce = dayjs(c.end);
+      return ce.isAfter(acc) ? ce : acc;
+    }, dayjs(exactConflicts[0].end));
 
     const now = dayjs();
-    const baseStart = latestEnd.isAfter(now) ? latestEnd : now; // if conflict already ended, start from "now"
-    const dur = DEFAULT_DURATION_MIN;
+    const baseStart = latestEnd.isAfter(now) ? latestEnd : now;
+    const dur = newEventDurationMin;
 
     const opt1Start = baseStart;
     const opt1End = opt1Start.add(dur, "minute");
@@ -69,47 +77,75 @@ export default function CreateConflictModal({
     const opt3Start = now.add(1, "day").startOf("day").hour(8).minute(0).second(0);
     const opt3End = opt3Start.add(dur, "minute");
 
-    const s1 = { key: "after", start: opt1Start.toDate(), end: opt1End.toDate(), hint: "After current conflict" };
-    const s2 = { key: "plus1h", start: opt2Start.toDate(), end: opt2End.toDate(), hint: "+1 hour" };
-    const s3 = { key: "tomorrow8", start: opt3Start.toDate(), end: opt3End.toDate(), hint: "Tomorrow 8:00 AM" };
+    const fmt = (s, e) =>
+      (s.isSame(e, "day")
+        ? `${s.format("MMM D, h:mm A")} – ${e.format("h:mm A")}`
+        : `${s.format("MMM D, h:mm A")} – ${e.format("MMM D, h:mm A")}`);
 
-    return [s1, s2, s3].map((s) => ({ ...s, label: formatSlotRange(s) }));
-  }, [conflicts]);
+    return [
+      {
+        key: "after",
+        start: opt1Start.toDate(),
+        end: opt1End.toDate(),
+        label: fmt(opt1Start, opt1End),
+        hint: "After conflict",
+      },
+      {
+        key: "plus1h",
+        start: opt2Start.toDate(),
+        end: opt2End.toDate(),
+        label: fmt(opt2Start, opt2End),
+        hint: "+1 hour",
+      },
+      {
+        key: "tomorrow8",
+        start: opt3Start.toDate(),
+        end: opt3End.toDate(),
+        label: fmt(opt3Start, opt3End),
+        hint: "Tomorrow 8:00 AM",
+      },
+    ];
+  }, [exactConflicts, newEvent, newEventDurationMin]);
 
-  // Refresh suggestions whenever the modal opens or conflicts change
+  // Only compute suggestions when: open + exact matches exist.
   useEffect(() => {
     if (!isOpen) return;
-
-    if (suggestions.length > 0) {
-      // Use external suggestions if provided
-      setAvailableSlots(
-        suggestions.map((slot, i) => {
-          const s = { start: new Date(slot.start), end: new Date(slot.end) };
-          return {
-            key: `ext-${i}`,
-            label: formatSlotRange(s),
-            hint: "Suggested",
-            start: s.start,
-            end: s.end,
-          };
-        })
-      );
+    if (exactConflicts.length === 0) {
+      setAvailableSlots([]);
       return;
     }
 
-    if (conflicts.length > 0) {
-      setAvailableSlots(buildUpcomingSuggestions());
-    } else {
-      setAvailableSlots([]);
+    // Prefer external suggestions (if provided)
+    if (Array.isArray(suggestions) && suggestions.length > 0) {
+      const mapped = suggestions.map((slot, i) => {
+        const s = dayjs(slot.start);
+        const e = dayjs(slot.end);
+        const sameDay = s.isSame(e, "day");
+        const label = sameDay
+          ? `${s.format("MMM D, h:mm A")} – ${e.format("h:mm A")}`
+          : `${s.format("MMM D, h:mm A")} – ${e.format("MMM D, h:mm A")}`;
+        return {
+          key: `ext-${i}`,
+          start: s.toDate(),
+          end: e.toDate(),
+          label,
+          hint: "Suggested",
+        };
+      });
+      setAvailableSlots(mapped);
+      return;
     }
-  }, [isOpen, conflicts, suggestions, buildUpcomingSuggestions]);
 
-  // reset confirmation state whenever modal closes
+    setAvailableSlots(buildSuggestions());
+  }, [isOpen, exactConflicts, suggestions, buildSuggestions]);
+
+  // Reset confirm state on close
   useEffect(() => {
     if (!isOpen) setConfirmKeep(false);
   }, [isOpen]);
 
-  if (!isOpen) return null;
+  // 🔒 Show nothing unless: modal is open AND there are exact matches
+  if (!isOpen || exactConflicts.length === 0) return null;
 
   const handleKeepClick = () => {
     if (!confirmKeep) {
@@ -119,20 +155,22 @@ export default function CreateConflictModal({
     onKeep?.();
   };
 
-  // Prefer internal/external computed slots
-  const timeSuggestions = availableSlots;
-
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+    <div
+      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+      role="dialog"
+      aria-modal="true"
+    >
       <div className="bg-white p-6 rounded-2xl shadow-xl w-full max-w-lg">
-        <h2 className="text-xl font-bold mb-2">Time Conflict Detected</h2>
+        <h2 className="text-xl font-bold mb-2">Exact Time Conflict</h2>
+
         <p className="text-sm text-gray-600 mb-4">
-          Your new event overlaps with {conflicts.length} existing event
-          {conflicts.length !== 1 ? "s" : ""}.
+          Your new event exactly matches the time of {exactConflicts.length} existing event
+          {exactConflicts.length !== 1 ? "s" : ""} (same start and end).
         </p>
 
         <div className="mb-4 max-h-40 overflow-y-auto">
-          {conflicts.map((c) => {
+          {exactConflicts.map((c) => {
             const s = dayjs(c.start);
             const e = dayjs(c.end);
             const sameDay = s.isSame(e, "day");
@@ -144,17 +182,19 @@ export default function CreateConflictModal({
                     ? `${s.format("MMM D, h:mm A")} – ${e.format("h:mm A")}`
                     : `${s.format("MMM D, h:mm A")} – ${e.format("MMM D, h:mm A")}`}
                 </div>
+                <div className="text-xs text-gray-500 mt-1">
+                  Difficulty: {c.difficulty || "medium"} · Urgency: {c.urgency} · Importance: {c.importance}
+                </div>
               </div>
             );
           })}
         </div>
 
-        {/* Suggestions */}
-        {timeSuggestions.length > 0 && (
+        {availableSlots.length > 0 && (
           <>
             <h3 className="text-sm font-semibold mb-2">Suggested times</h3>
             <div className="grid grid-cols-1 gap-2 mb-4">
-              {timeSuggestions.map((slot) => (
+              {availableSlots.map((slot) => (
                 <button
                   key={slot.key ?? `${slot.start}-${slot.end}`}
                   onClick={() => onReschedule?.({ start: slot.start, end: slot.end })}
@@ -168,27 +208,13 @@ export default function CreateConflictModal({
           </>
         )}
 
-        {/* Keep confirmation / warnings */}
         {confirmKeep && (
           <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3">
             <p className="text-sm font-semibold text-amber-800">Heads up before keeping both:</p>
             <ul className="mt-1 text-xs text-amber-800 list-disc pl-5 space-y-1">
-              <li>
-                You will be <b>double-booked</b> during the overlapping time and might miss one of
-                the events.
-              </li>
-              {maybeSameTask ? (
-                <li>
-                  The incoming event seems to be the <b>same task</b> (same title) as one of the
-                  conflicts. Consider replacing or rescheduling to avoid duplication.
-                </li>
-              ) : (
-                <li>
-                  If these represent the <b>same task</b>, consider replacing or rescheduling to
-                  avoid duplication.
-                </li>
-              )}
-              <li>You can always adjust later—edit one of the events or split it into segments.</li>
+              <li>You will be <b>double-booked</b> during that time.</li>
+              <li>If these are the <b>same task</b>, consider replacing or rescheduling.</li>
+              <li>You can adjust later—edit one event or split it.</li>
             </ul>
           </div>
         )}
@@ -197,10 +223,10 @@ export default function CreateConflictModal({
           <button
             onClick={onReplace}
             className="flex-1 px-4 py-2 rounded bg-yellow-500 text-white hover:bg-yellow-600"
+            title="Replace the existing conflicting event with the new one"
           >
             Replace Existing
           </button>
-
         </div>
 
         <div className="flex flex-col sm:flex-row gap-2 mt-2">
